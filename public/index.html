@@ -124,22 +124,43 @@
   <div class="modal hidden" id="adminModal">
     <div class="modal-card">
       <button class="modal-x" id="adminClose">✕</button>
-      <div id="adminLogin">
+      <div id="adminLogin" class="hidden">
         <h2>管理后台</h2>
-        <p class="muted">请输入管理员密码（ADMIN_KEY）；若部署时配置了 <code>ADMIN_API_TOKEN</code>，可直接用它作为 Bearer token 调用管理接口（无需登录），也可把该 token 填到下方密码框完成登录。</p>
-        <input type="password" id="adminPwd" placeholder="管理员密码 / ADMIN_API_TOKEN" autocomplete="off" />
-        <button class="primary-btn" id="adminLoginBtn">登录</button>
-        <p class="muted small">提示：管理接口也支持 <code>Authorization: Bearer &lt;ADMIN_API_TOKEN&gt;</code> 直接调用，详见仓库 README 的「管理接口调用示例」。</p>
-        <p class="err" id="adminErr"></p>
+        <p class="muted" id="adminHint"></p>
+        <button class="primary-btn hidden" id="passkeyLoginBtn" data-admin-action>使用 Passkey 登录</button>
+        <button class="ghost-btn hidden" id="recoveryToggle" data-admin-action>无法使用 Passkey？使用备用码恢复</button>
+        <div id="adminCodePanel" class="hidden">
+          <label for="adminPwd" id="adminCodeLabel">API 密钥</label>
+          <input type="password" id="adminPwd" placeholder="ADMIN_API_TOKEN" autocomplete="off" spellcheck="false" />
+          <button class="primary-btn" id="adminLoginBtn" data-admin-action>验证并绑定 Passkey</button>
+        </div>
+      </div>
+      <div id="adminRegisterPanel" class="hidden">
+        <h2>绑定 Passkey</h2>
+        <p class="muted">使用系统指纹、人脸、设备 PIN 或安全密钥。只有绑定成功后才能访问管理后台。</p>
+        <button class="primary-btn" id="passkeyRegisterBtn" data-admin-action>创建 Passkey</button>
+        <button class="ghost-btn" id="setupLogout" data-admin-action>取消并退出</button>
+      </div>
+      <div id="adminBackupPanel" class="hidden">
+        <h2>保存备用码</h2>
+        <p class="muted">仅显示这一次，请保存在密码管理器等安全位置。备用码只能使用一次，恢复后旧码立即失效。首次绑定后，原 API 密钥不再用于管理登录。</p>
+        <label for="backupCode">Backup code</label>
+        <input type="text" id="backupCode" readonly autocomplete="off" spellcheck="false" />
+        <div class="backup-actions">
+          <button class="mini-btn" id="copyBackup">复制备用码</button>
+          <button class="primary-btn" id="backupSaved" data-admin-action>已安全保存，继续</button>
+        </div>
       </div>
       <div id="adminDash" class="hidden">
         <div class="dash-head">
           <h2>管理后台</h2>
-          <button class="ghost-btn" id="adminLogout">退出</button>
+          <button class="ghost-btn" id="adminLogout" data-admin-action>退出</button>
         </div>
         <div class="stats" id="adminStats"></div>
         <div class="dash-actions">
           <button class="mini-btn" id="sweepBtn">清理过期</button>
+          <button class="mini-btn" id="addPasskeyBtn" data-admin-action>添加 Passkey</button>
+          <button class="mini-btn" id="rotateBackupBtn" data-admin-action>重置备用码</button>
         </div>
         <div class="table-wrap">
           <table class="share-table">
@@ -150,6 +171,7 @@
           </table>
         </div>
       </div>
+      <p class="err" id="adminErr" role="alert"></p>
     </div>
   </div>
 

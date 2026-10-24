@@ -8,11 +8,19 @@
     "dev": "wrangler dev --config wrangler.toml",
     "deploy": "wrangler deploy --config wrangler.toml",
     "migrate": "wrangler d1 migrations apply filecodebox --config wrangler.toml",
-    "test": "node test_local.mjs"
+    "test": "node test_local.mjs && node test_admin.mjs",
+    "test:admin": "node test_admin.mjs",
+    "test:runtime": "node test_runtime.mjs",
+    "test:pages": "node test_pages.mjs",
+    "pages:build": "node scripts/build-pages.mjs",
+    "prepages:deploy": "npm run pages:build",
+    "pages:deploy": "wrangler pages deploy --cwd pages --project-name filecodebox-cf --branch main --commit-dirty=true"
   },
   "devDependencies": {
-    "wrangler": "^4.0.0",
-    "playwright-core": "^1.62.0"
+    "playwright-core": "^1.62.0",
+    "wrangler": "^4.152.0"
   },
-  "dependencies": {}
+  "dependencies": {
+    "@simplewebauthn/server": "14.0.3"
+  }
 }

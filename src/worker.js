@@ -1,4 +1,4 @@
-// FileCodeBox-CF · Worker 入口（零依赖，纯 Web 标准 API）
+// FileCodeBox-CF · Worker 入口
 //
 // 路由说明：
 //   /api/share            POST  创建分享（文本 / 文件）
@@ -6,12 +6,12 @@
 //   /api/share/:code/claim POST 取件（消耗一次，文本直接返回 / 文件返回短时防直链 URL）
 //   /api/imgbed/upload    POST  把文件流式代理到 ImgBed 的 /upload（原生支持大文件）
 //   /file/:key?c=&t=      GET   校验短时 token + 分享状态后：ImgBed 302 / Telegram 服务端取回
-//   /api/admin/*          *     管理接口（Bearer；未配置 ADMIN_KEY 时不再有默认密钥）
+//   /api/admin/*          *     WebAuthn 管理接口（HttpOnly 会话）
 //   /api/install          GET/POST 初始化 D1（幂等）
 //   /api/config、/api/health
 //
 // 安全要点：
-//   · 管理员 token / 文件 token / 上传 token 均使用恒定时间比较且带过期时间
+//   · 管理员使用 WebAuthn 与有过期时间的 Cookie；文件/上传 token 使用 HMAC
 //   · 文件响应统一 attachment + nosniff，避免上传 HTML/SVG 后在本站同源执行
 //   · 管理接口不加通配 CORS；公开 API 保留 CORS
 
@@ -19,6 +19,7 @@ import * as api from './api.js';
 import * as storage from './storage.js';
 import * as db from './db.js';
 import * as telegram from './telegram.js';
+import * as admin from './admin.js';
 import { isValidFileKey } from './auth.js';
 
 const CSP = [
@@ -137,7 +138,14 @@ const ROUTES = [
     }
     return storage.serveFromImgBed(env, request, key, code);
   } },
-  { method: 'POST', pattern: '/api/admin/login', handler: api.adminLogin },
+  { method: 'GET', pattern: '/api/admin/status', handler: admin.status },
+  { method: 'POST', pattern: '/api/admin/login', handler: admin.login },
+  { method: 'POST', pattern: '/api/admin/passkey/register/options', handler: admin.registrationOptions },
+  { method: 'POST', pattern: '/api/admin/passkey/register/verify', handler: admin.registrationVerify },
+  { method: 'POST', pattern: '/api/admin/passkey/login/options', handler: admin.authenticationOptions },
+  { method: 'POST', pattern: '/api/admin/passkey/login/verify', handler: admin.authenticationVerify },
+  { method: 'POST', pattern: '/api/admin/backup/rotate', handler: admin.rotateBackup },
+  { method: 'POST', pattern: '/api/admin/logout', handler: admin.logout },
   { method: 'GET', pattern: '/api/admin/stats', handler: api.adminStats },
   { method: 'GET', pattern: '/api/admin/shares', handler: api.adminList },
   { method: 'DELETE', pattern: '/api/admin/share/:code', handler: api.adminDelete },
@@ -178,6 +186,10 @@ export default {
     if (found) {
       const context = { request, env, ctx, params: found.params };
       try {
+        if (adminPath) {
+          const denied = admin.checkAdminRequest(request, env);
+          if (denied) return withSecurityHeaders(denied, { cors: false, noStore: true });
+        }
         const res = await found.handler(context);
         const out = method === 'HEAD'
           ? new Response(null, { status: res.status, headers: res.headers })
@@ -222,6 +234,7 @@ export default {
   // Cron Trigger：定期清理过期 / 超额分享
   async scheduled(event, env, ctx) {
     const keys = await db.sweepExpired(env.fcb_db, Date.now());
+    await admin.cleanupAdmin(env.fcb_db);
     for (const k of [...new Set(keys)]) {
       ctx.waitUntil((async () => {
         const remaining = await db.countSharesByFileKey(env.fcb_db, k);

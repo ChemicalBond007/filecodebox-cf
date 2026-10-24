@@ -1,11 +1,13 @@
 // FileCodeBox-CF · 分享记录数据库（FileCodeBox 自有 D1: fcb_db）
-// 仅负责分享元数据（取件码、类型、过期、次数、密码哈希等）。
+// 负责分享元数据和管理员 Passkey / 会话状态。
 // 文件二进制本体存放在 ImgBed 的 R2 桶（img_r2），不在此处。
 
 // 自举建表（Bootstrap）：Cloudflare D1 支持在运行时执行 DDL。
 // 部署后无需手动跑 wrangler d1 execute，Worker 会在首次访问（或显式 /api/install）时
 // 自动执行 CREATE TABLE IF NOT EXISTS，幂等、可重复执行。
-// 建表语句与 migrations/0001_init.sql 保持一致。
+// 建表语句与 migrations/0001_init.sql、0002_admin_passkeys.sql 保持一致。
+import { ADMIN_SCHEMA_SQL } from './admin-schema.js';
+
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS shares (
   code           TEXT PRIMARY KEY,
@@ -24,26 +26,20 @@ CREATE TABLE IF NOT EXISTS shares (
 );
 CREATE INDEX IF NOT EXISTS idx_shares_created_at ON shares(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_shares_expire_at ON shares(expire_at);
-`;
+` + ADMIN_SCHEMA_SQL;
 
-// 模块级缓存：每个 Worker 实例（冷启动）只真正执行一次建表；
-// 之后所有请求复用同一 Promise。建表语句本身 IF NOT EXISTS，重复执行无副作用。
-let schemaReady = null;
+// 只缓存完成标记，不缓存请求产生的 Promise 或数据库 I/O。
+const schemaReady = new WeakSet();
 export async function ensureSchema(db) {
   if (!db) return; // 未绑定 fcb_db 时跳过（防御）
-  if (!schemaReady) {
-    schemaReady = (async () => {
-      for (const raw of SCHEMA_SQL.split(';')) {
-        const stmt = raw.trim();
-        if (!stmt) continue;
-        await db.prepare(stmt).run();
-      }
-    })().catch((e) => {
-      schemaReady = null; // 失败后允许下次请求重试
-      throw e;
-    });
+  if (schemaReady.has(db)) return;
+  for (const raw of SCHEMA_SQL.split(';')) {
+    const stmt = raw.trim();
+    if (stmt) await db.prepare(stmt).run();
   }
-  await schemaReady;
+  await db.prepare('INSERT OR IGNORE INTO admin_auth (id, user_id) VALUES (1, ?)')
+    .bind(crypto.randomUUID()).run();
+  schemaReady.add(db);
 }
 
 export async function createShare(db, row) {

@@ -5,13 +5,11 @@ import {
   genCode,
   hashPassword,
   verifyPassword,
-  constantTimeEqual,
-  verifyAdmin,
-  expectedAdminToken,
   fileToken,
   verifyUploadToken,
   isValidFileKey,
 } from './auth.js';
+import { getAdminSession } from './admin.js';
 import { EXPIRE_PRESETS, DOWNLOAD_PRESETS, appName, appSubtitle } from './config.js';
 
 export function json(data, status = 200) {
@@ -196,35 +194,8 @@ export async function claimShare({ request, params, env }) {
 
 // ---------- 管理员 ----------
 
-export async function adminLogin({ request, env }) {
-  let password = '';
-  const ct = request.headers.get('Content-Type') || '';
-  if (ct.includes('application/json')) {
-    const b = await request.json().catch(() => ({}));
-    password = b.password || '';
-  } else {
-    const f = await request.formData().catch(() => null);
-    password = f ? f.get('password') || '' : '';
-  }
-  const input = String(password);
-
-  // 若配置了静态 ADMIN_API_TOKEN，则它本身就是可直接使用的 Bearer token：
-  // 在登录框填入该 token 也会直接返回它，前端拿到后即可用 Bearer 调用管理接口。
-  if (env.ADMIN_API_TOKEN && constantTimeEqual(input, String(env.ADMIN_API_TOKEN))) {
-    return json({ token: env.ADMIN_API_TOKEN });
-  }
-
-  // 未配置 ADMIN_KEY 时，不再回退到任何默认密钥。
-  if (!env.ADMIN_KEY || !constantTimeEqual(input, String(env.ADMIN_KEY))) {
-    return json({ error: '管理员密码错误' }, 401);
-  }
-  const token = await expectedAdminToken(env);
-  if (!token) return json({ error: '管理员未配置' }, 401);
-  return json({ token });
-}
-
 async function requireAdmin(env, request) {
-  if (!(await verifyAdmin(env, request))) {
+  if ((await getAdminSession(env, request))?.scope !== 'admin') {
     return json({ error: '未授权' }, 401);
   }
   return null;

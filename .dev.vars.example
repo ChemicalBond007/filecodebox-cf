@@ -1,5 +1,5 @@
-# 至少设置 ADMIN_API_TOKEN 或 ADMIN_KEY 之一；FILE_SECRET 强烈建议单独设置。
-ADMIN_KEY=your-local-admin-key
+# API 密钥只用于首次绑定 Passkey；上线必须使用稳定的 HTTPS 前端 origin。
+ADMIN_ORIGIN=http://localhost:8787
 ADMIN_API_TOKEN=your-local-admin-api-token
 FILE_SECRET=your-local-file-secret
 APP_NAME=文件快递柜

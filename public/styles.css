@@ -261,6 +261,12 @@ textarea:focus, input:focus, select:focus { border-color: var(--accent); box-sha
 .err { color: #d6452f; font-size: 13px; min-height: 18px; margin: 8px 0 0; }
 #adminLogin input { margin-top: 12px; }
 #adminLogin .primary-btn { margin-top: 14px; }
+#adminCodePanel label { display: block; margin-top: 16px; font-size: 13px; }
+#recoveryToggle, #setupLogout { margin-top: 16px; }
+#backupCode { margin: 12px 0; font-family: monospace; overflow-wrap: anywhere; }
+.backup-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.backup-actions .primary-btn { width: auto; flex: 1; }
+button:disabled { opacity: .6; cursor: wait; }
 
 .dash-head { display: flex; align-items: center; justify-content: space-between; }
 .stats { display: flex; gap: 12px; margin: 16px 0; }
@@ -269,7 +275,7 @@ textarea:focus, input:focus, select:focus { border-color: var(--accent); box-sha
 }
 .stat .num { font-size: 24px; font-weight: 800; color: var(--accent-d); }
 .stat .lbl { font-size: 12px; color: var(--muted); margin-top: 2px; }
-.dash-actions { display: flex; gap: 8px; margin-bottom: 12px; }
+.dash-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
 
 .table-wrap { overflow-x: auto; }
 .share-table { width: 100%; border-collapse: collapse; font-size: 13px; }

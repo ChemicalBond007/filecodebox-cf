@@ -23,6 +23,7 @@ import worker from './src/worker.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(__dirname, 'public');
 const PORT = parseInt(process.env.PORT || '8000', 10);
+const HOST = process.env.HOST || '127.0.0.1';
 const IMGBED_PORT = 8790;
 const USE_REAL_IMGBED = process.env.FCB_IMGBED_REAL === '1';
 const IMG_BED_URL = process.env.FCB_IMGBED_URL || `http://127.0.0.1:${IMGBED_PORT}`;
@@ -82,9 +83,22 @@ class Stmt {
   _all() { return this.db.prepare(this.q).all(...this.params); }
   first() { const r = this._all(); return r.length ? r[0] : null; }
   all() { return { results: this._all() }; }
-  run() { this.db.prepare(this.q).run(...this.params); return { success: true, meta: {} }; }
+  run() {
+    const result = this.db.prepare(this.q).run(...this.params);
+    return { success: true, meta: { changes: Number(result.changes) } };
+  }
 }
-const fcb_db = { prepare: (q) => new Stmt(sqlite, q) };
+const fcb_db = {
+  prepare: (q) => new Stmt(sqlite, q),
+  batch(statements) {
+    sqlite.exec('BEGIN IMMEDIATE');
+    try {
+      const results = statements.map(s => s.run());
+      sqlite.exec('COMMIT');
+      return results;
+    } catch (e) { sqlite.exec('ROLLBACK'); throw e; }
+  },
+};
 
 // ---------- ImgBed mock（监听 127.0.0.1:8790） ----------
 const store = new Map(); // id -> { bytes, contentType }
@@ -183,6 +197,7 @@ const env = {
   TG_CHAT_ID: USE_TG_MOCK ? (process.env.FCB_TG_CHAT || '-100123456') : '',
   ADMIN_KEY: 'preview-admin',
   ADMIN_API_TOKEN: process.env.FCB_ADMIN_API_TOKEN || '',
+  ADMIN_ORIGIN: process.env.FCB_ADMIN_ORIGIN || `http://localhost:${PORT}`,
   FILE_SECRET: 'preview-file-secret',
   APP_NAME: '文件快递柜',
   APP_SUBTITLE: '本地预览 · 委托 CloudFlare-ImgBed（mock）',
@@ -261,6 +276,6 @@ if (!USE_REAL_IMGBED && !USE_TG_MOCK) {
 } else {
   console.log(`[preview] 真实 ImgBed 模式：${IMG_BED_URL}`);
 }
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[preview] FileCodeBox-CF 本地预览运行中：http://0.0.0.0:${PORT}`);
+server.listen(PORT, HOST, () => {
+  console.log(`[preview] FileCodeBox-CF 本地预览运行中：http://${HOST}:${PORT}`);
 });

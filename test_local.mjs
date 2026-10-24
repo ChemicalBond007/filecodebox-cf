@@ -5,6 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { readFileSync } from 'node:fs';
 import worker from './src/worker.js';
 import { hmac, fileToken } from './src/auth.js';
+import { bindTestAdmin } from './tests/helpers.mjs';
 
 // ---- 内存 SQLite 模拟 D1（仅 fcb_db，分享元数据） ----
 const sqlite = new DatabaseSync(':memory:');
@@ -21,7 +22,17 @@ class Stmt {
     return { success: true, meta: { changes: Number(info.changes || 0) } };
   }
 }
-const fcb_db = { prepare: (q) => new Stmt(sqlite, q) };
+const fcb_db = {
+  prepare: (q) => new Stmt(sqlite, q),
+  batch(statements) {
+    sqlite.exec('BEGIN IMMEDIATE');
+    try {
+      const results = statements.map(s => s.run());
+      sqlite.exec('COMMIT');
+      return results;
+    } catch (e) { sqlite.exec('ROLLBACK'); throw e; }
+  },
+};
 
 // ---- 模拟 CloudFlare-ImgBed 的 HTTP API ----
 const IMG_BED_URL = 'https://imgbed.test';
@@ -99,6 +110,8 @@ const env = {
   fcb_db,
   IMG_BED_URL,
   ADMIN_KEY: 'secret123',
+  ADMIN_API_TOKEN: 'local-bootstrap',
+  ADMIN_ORIGIN: 'https://x.com',
   FILE_SECRET: 'filesec',
   APP_NAME: 'T',
   APP_SUBTITLE: 'S',
@@ -112,6 +125,9 @@ function ok(cond, msg) { if (cond) { pass++; } else { fail++; console.error('   
 function eq(a, b, msg) { ok(a === b, `${msg} (期望 ${JSON.stringify(b)}, 实际 ${JSON.stringify(a)})`); }
 
 async function call(method, path, body, headers = {}) {
+  if (path.startsWith('/api/admin/') && !['GET', 'HEAD'].includes(method)) {
+    headers = { Origin: env.ADMIN_ORIGIN, 'Content-Type': 'application/json', ...headers };
+  }
   const init = { method, headers };
   if (body instanceof FormData) init.body = body;
   else if (body !== undefined) { init.body = JSON.stringify(body); init.headers = { 'Content-Type': 'application/json', ...headers }; }
@@ -239,13 +255,13 @@ let fileCode, fileKey;
 }
 
 // ---- 6. 管理员 ----
-let adminToken;
+let adminCookie;
 {
-  const wrong = await call('POST', '/api/admin/login', { password: 'bad' });
-  eq(wrong.status, 401, '错误密码 401');
-  const ok1 = await (await call('POST', '/api/admin/login', { password: 'secret123' })).json();
-  ok(ok1.token, '登录返回 token');
-  adminToken = ok1.token;
+  const wrong = await call('POST', '/api/admin/login', { code: 'bad' });
+  eq(wrong.status, 401, '错误 API 密钥 401');
+  const admin = await bindTestAdmin(call, env.ADMIN_API_TOKEN, env.ADMIN_ORIGIN);
+  adminCookie = admin.cookie;
+  ok(admin.backupCode && admin.key, '绑定 Passkey 并返回一次性备用码');
 
   const noAuth = await call('GET', '/api/admin/shares');
   eq(noAuth.status, 401, '无 token 访问 401');
@@ -255,9 +271,9 @@ let adminToken;
   });
   eq(defaultTokenRes.status, 401, '公开默认密钥 token 不再可用');
 
-  const list = await (await call('GET', '/api/admin/shares', undefined, { Authorization: 'Bearer ' + adminToken })).json();
+  const list = await (await call('GET', '/api/admin/shares', undefined, { Cookie: adminCookie })).json();
   ok(Array.isArray(list.shares) && list.shares.length >= 3, '分享列表非空: ' + list.shares.length);
-  const stats = await (await call('GET', '/api/admin/stats', undefined, { Authorization: 'Bearer ' + adminToken })).json();
+  const stats = await (await call('GET', '/api/admin/stats', undefined, { Cookie: adminCookie })).json();
   ok(stats.total >= 3, '统计 total>=3: ' + stats.total);
 }
 
@@ -269,7 +285,7 @@ let adminToken;
   const code = (await r.json()).code;
   const claim = await (await call('POST', '/api/share/' + code + '/claim')).json();
 
-  const del = await call('DELETE', '/api/admin/share/' + code, undefined, { Authorization: 'Bearer ' + adminToken });
+  const del = await call('DELETE', '/api/admin/share/' + code, undefined, { Cookie: adminCookie });
   eq(del.status, 200, '删除 200');
   const meta = await call('GET', '/api/share/' + code);
   eq(meta.status, 404, '删除后元信息 404');
@@ -289,7 +305,7 @@ let adminToken;
   const createJ = await createR.json();
   await fcb_db.prepare('UPDATE shares SET expire_at = ? WHERE code = ?').bind(Date.now() - 60_000, createJ.code).run();
 
-  const sweep = await (await call('POST', '/api/admin/sweep', undefined, { Authorization: 'Bearer ' + adminToken })).json();
+  const sweep = await (await call('POST', '/api/admin/sweep', undefined, { Cookie: adminCookie })).json();
   ok(sweep.cleaned >= 1, 'sweep 清理了至少 1 条: ' + sweep.cleaned);
   ok(sweep.cleaned >= 1, 'sweep 清理了至少 1 条: ' + sweep.cleaned);
   ok(deletedIds.includes(up.id) || !uploaded[up.id], 'sweep 同步清理了 ImgBed 侧的过期对象');

@@ -8,13 +8,13 @@ const PBKDF2_ITERATIONS = 100000;
 const UPLOAD_TOKEN_TTL = 60 * 60 * 1000; // 上传凭证 1 小时
 const CHUNK_TOKEN_TTL = 60 * 60 * 1000; // 分片凭证 1 小时
 
-function toBase64Url(bytes) {
+export function toBase64Url(bytes) {
   let bin = '';
   for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
   return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-function fromBase64Url(s) {
+export function fromBase64Url(s) {
   s = String(s).replace(/-/g, '+').replace(/_/g, '/');
   while (s.length % 4) s += '=';
   const bin = atob(s);
@@ -210,29 +210,4 @@ export function genKey() {
   const buf = new Uint8Array(16);
   crypto.getRandomValues(buf);
   return toHex(buf);
-}
-
-// ---------- 管理员鉴权 ----------
-
-// 静态管理员 token：HMAC(ADMIN_KEY, 'fcb-admin')。
-// 没有 ADMIN_KEY 时返回 null，调用方必须 fail-closed，绝不能使用默认密钥。
-export async function expectedAdminToken(env) {
-  if (!env.ADMIN_KEY) return null;
-  return hmac(String(env.ADMIN_KEY), 'fcb-admin');
-}
-
-export async function verifyAdmin(env, request) {
-  const auth = request.headers.get('Authorization') || '';
-  const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
-  if (!token) return false;
-
-  // 推荐用法：静态 API Token（恒定时间比较）
-  if (env.ADMIN_API_TOKEN && constantTimeEqual(token, String(env.ADMIN_API_TOKEN))) {
-    return true;
-  }
-
-  // 旧式密码登录派生的 token；未配置 ADMIN_KEY 时直接拒绝。
-  if (!env.ADMIN_KEY) return false;
-  const expected = await expectedAdminToken(env);
-  return expected ? constantTimeEqual(token, expected) : false;
 }

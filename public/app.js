@@ -8,8 +8,9 @@
   let state = {
     type: 'text',
     file: null,
-    adminToken: localStorage.getItem('fcb_admin_token') || '',
   };
+  // 清除旧版本长期令牌。管理员凭证只保存在 HttpOnly Cookie 中。
+  try { localStorage.removeItem('fcb_admin_token'); } catch { /* 存储被禁用 */ }
 
   // ---------- 工具 ----------
   function toast(msg) {
@@ -275,67 +276,173 @@
 
   // ---------- 管理后台 ----------
   const modal = $('#adminModal');
+  let adminBusy = false;
+  let backupContinue = null;
   $('#adminBtn').addEventListener('click', openAdmin);
-  $('#adminClose').addEventListener('click', () => modal.classList.add('hidden'));
-  modal.addEventListener('click', (e) => { if (e.target === modal) modal.classList.add('hidden'); });
+  function closeAdmin() {
+    if (adminBusy) return;
+    if (backupContinue) { toast('请先安全保存备用码并确认'); return; }
+    $('#adminPwd').value = '';
+    modal.classList.add('hidden');
+  }
+  $('#adminClose').addEventListener('click', closeAdmin);
+  modal.addEventListener('click', (e) => { if (e.target === modal) closeAdmin(); });
 
+  const adminPost = (path, data = {}) => api('/api/admin/' + path, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data),
+  });
+  function adminPanel(id) {
+    ['adminLogin', 'adminRegisterPanel', 'adminBackupPanel', 'adminDash']
+      .forEach(p => $('#' + p).classList.toggle('hidden', p !== id));
+  }
+  async function adminAction(fn) {
+    if (adminBusy) return;
+    adminBusy = true;
+    $$('[data-admin-action]').forEach(b => { b.disabled = true; });
+    $('#adminErr').textContent = '';
+    try {
+      await fn();
+    } catch (e) {
+      $('#adminErr').textContent = e.name === 'NotAllowedError'
+        ? 'Passkey 操作已取消或超时，请重新尝试。' : e.message;
+    } finally {
+      adminBusy = false;
+      $$('[data-admin-action]').forEach(b => { b.disabled = false; });
+    }
+  }
+
+  async function refreshAdmin() {
+    const s = await api('/api/admin/status');
+    if (s.authenticated) {
+      adminPanel('adminDash');
+      await loadAdmin();
+    } else if (s.scope === 'bootstrap' || s.scope === 'recovery') {
+      adminPanel('adminRegisterPanel');
+    } else {
+      adminPanel('adminLogin');
+      $('#adminHint').textContent = s.initialized
+        ? '通过设备指纹、人脸、PIN 或安全密钥验证。原 API 密钥已停用。'
+        : '首次使用：输入 ADMIN_API_TOKEN 验证，然后绑定系统 Passkey。';
+      $('#passkeyLoginBtn').classList.toggle('hidden', !s.initialized);
+      $('#recoveryToggle').classList.toggle('hidden', !s.initialized);
+      $('#adminCodePanel').classList.toggle('hidden', s.initialized);
+      $('#adminCodeLabel').textContent = s.initialized ? '一次性备用码' : 'API 密钥';
+      $('#adminPwd').placeholder = s.initialized ? 'Backup code' : 'ADMIN_API_TOKEN';
+      $('#adminLoginBtn').textContent = s.initialized ? '恢复并绑定新 Passkey' : '验证并绑定 Passkey';
+    }
+  }
   function openAdmin() {
     modal.classList.remove('hidden');
-    if (state.adminToken) {
-      $('#adminLogin').classList.add('hidden');
-      $('#adminDash').classList.remove('hidden');
-      loadAdmin();
-    } else {
-      $('#adminLogin').classList.remove('hidden');
-      $('#adminDash').classList.add('hidden');
-      $('#adminErr').textContent = '';
-      $('#adminPwd').focus();
+    if (!backupContinue) return adminAction(refreshAdmin);
+  }
+  $('#recoveryToggle').addEventListener('click', () => {
+    $('#adminCodePanel').classList.toggle('hidden');
+    $('#adminPwd').focus();
+  });
+  function showBackup(code, next) {
+    $('#backupCode').value = code;
+    backupContinue = next;
+    adminPanel('adminBackupPanel');
+  }
+  $('#copyBackup').addEventListener('click', () => copy($('#backupCode').value, '已复制，请安全保存'));
+  $('#backupSaved').addEventListener('click', () => adminAction(async () => {
+    const next = backupContinue;
+    backupContinue = null;
+    $('#backupCode').value = '';
+    if (next) await next();
+  }));
+  $('#adminLoginBtn').addEventListener('click', () => adminAction(async () => {
+    let data;
+    try { data = await adminPost('login', { code: $('#adminPwd').value }); }
+    finally { $('#adminPwd').value = ''; }
+    if (data.backup_code) showBackup(data.backup_code, async () => adminPanel('adminRegisterPanel'));
+    else adminPanel('adminRegisterPanel');
+  }));
+
+  // 原生 WebAuthn，二进制字段与服务器 JSON 的 base64url 互转，无外部脚本。
+  function decodeWebAuthn(value) {
+    const s = value.replace(/-/g, '+').replace(/_/g, '/');
+    return Uint8Array.from(atob(s + '='.repeat((4 - s.length % 4) % 4)), c => c.charCodeAt(0));
+  }
+  function encodeWebAuthn(value) {
+    return btoa(String.fromCharCode(...new Uint8Array(value)))
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+  function webAuthnResponse(credential) {
+    const r = credential.response;
+    const response = { clientDataJSON: encodeWebAuthn(r.clientDataJSON) };
+    for (const key of ['attestationObject', 'authenticatorData', 'signature', 'userHandle']) {
+      if (r[key]) response[key] = encodeWebAuthn(r[key]);
+    }
+    if (r.getTransports) response.transports = r.getTransports();
+    return { id: credential.id, rawId: encodeWebAuthn(credential.rawId), type: credential.type,
+      authenticatorAttachment: credential.authenticatorAttachment,
+      clientExtensionResults: credential.getClientExtensionResults(), response };
+  }
+  function requireWebAuthn() {
+    if (!window.isSecureContext || !window.PublicKeyCredential) {
+      throw new Error('当前浏览器不支持 Passkey，请使用支持 WebAuthn 的浏览器和 HTTPS 地址。');
     }
   }
-
-  $('#adminLoginBtn').addEventListener('click', async () => {
-    try {
-      const data = await api('/api/admin/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password: $('#adminPwd').value }),
-      });
-      state.adminToken = data.token;
-      localStorage.setItem('fcb_admin_token', data.token);
-      $('#adminLogin').classList.add('hidden');
-      $('#adminDash').classList.remove('hidden');
-      loadAdmin();
-    } catch (e) {
-      $('#adminErr').textContent = e.message;
-    }
-  });
-
-  $('#adminLogout').addEventListener('click', () => {
-    state.adminToken = '';
-    localStorage.removeItem('fcb_admin_token');
-    modal.classList.add('hidden');
-  });
-
-  $('#sweepBtn').addEventListener('click', async () => {
-    try {
-      await api('/api/admin/sweep', { method: 'POST', headers: authHeader() });
-      toast('已清理');
-      loadAdmin();
-    } catch (e) { toast(e.message); }
-  });
-
-  function authHeader() {
-    return { Authorization: 'Bearer ' + state.adminToken };
+  async function registerPasskey() {
+    requireWebAuthn();
+    const { options, challengeId } = await adminPost('passkey/register/options');
+    const publicKey = { ...options, challenge: decodeWebAuthn(options.challenge),
+      user: { ...options.user, id: decodeWebAuthn(options.user.id) },
+      excludeCredentials: (options.excludeCredentials || []).map(c => ({ ...c, id: decodeWebAuthn(c.id) })) };
+    const credential = await navigator.credentials.create({ publicKey });
+    if (!credential) throw new Error('未创建 Passkey');
+    const data = await adminPost('passkey/register/verify', { challengeId, response: webAuthnResponse(credential) });
+    if (data.backup_code) showBackup(data.backup_code, refreshAdmin);
+    else await refreshAdmin();
   }
+  async function loginPasskey() {
+    requireWebAuthn();
+    const { options, challengeId } = await adminPost('passkey/login/options');
+    const publicKey = { ...options, challenge: decodeWebAuthn(options.challenge),
+      allowCredentials: (options.allowCredentials || []).map(c => ({ ...c, id: decodeWebAuthn(c.id) })) };
+    const credential = await navigator.credentials.get({ publicKey });
+    if (!credential) throw new Error('未选择 Passkey');
+    await adminPost('passkey/login/verify', { challengeId, response: webAuthnResponse(credential) });
+  }
+  $('#passkeyRegisterBtn').addEventListener('click', () => adminAction(registerPasskey));
+  $('#passkeyLoginBtn').addEventListener('click', () => adminAction(async () => {
+    await loginPasskey();
+    await refreshAdmin();
+  }));
+  $('#addPasskeyBtn').addEventListener('click', () => adminAction(async () => {
+    await loginPasskey(); // 添加凭证前要求一次新的用户验证。
+    await registerPasskey();
+  }));
+  $('#rotateBackupBtn').addEventListener('click', () => adminAction(async () => {
+    await loginPasskey();
+    const data = await adminPost('backup/rotate');
+    showBackup(data.backup_code, refreshAdmin);
+  }));
+  const logoutAdmin = () => adminAction(async () => {
+    await adminPost('logout');
+    $('#adminPwd').value = '';
+    $('#shareRows').textContent = '';
+    $('#adminStats').textContent = '';
+    await refreshAdmin();
+  });
+  $('#adminLogout').addEventListener('click', logoutAdmin);
+  $('#setupLogout').addEventListener('click', logoutAdmin);
+
+  $('#sweepBtn').addEventListener('click', () => adminAction(async () => {
+    await adminPost('sweep');
+    toast('已清理');
+    await loadAdmin();
+  }));
 
   async function loadAdmin() {
     try {
-      const s = await api('/api/admin/stats', { headers: authHeader() });
+      const s = await api('/api/admin/stats');
       $('#adminStats').innerHTML = `
         <div class="stat"><div class="num">${s.total}</div><div class="lbl">总分享</div></div>
         <div class="stat"><div class="num">${s.active}</div><div class="lbl">有效</div></div>
         <div class="stat"><div class="num">${s.expired}</div><div class="lbl">已失效</div></div>`;
-      const list = await api('/api/admin/shares', { headers: authHeader() });
+      const list = await api('/api/admin/shares');
       const rows = list.shares.map((r) => `
         <tr>
           <td class="code-cell">${escapeHtml(formatCode(r.code))}</td>
@@ -351,9 +458,7 @@
       );
     } catch (e) {
       if (/401|未授权/.test(e.message)) {
-        state.adminToken = '';
-        localStorage.removeItem('fcb_admin_token');
-        openAdmin();
+        await refreshAdmin();
       } else toast(e.message);
     }
   }
@@ -361,7 +466,7 @@
   async function delShare(code) {
     if (!confirm('确认删除取件码 ' + code + '？')) return;
     try {
-      await api('/api/admin/share/' + code, { method: 'DELETE', headers: authHeader() });
+      await api('/api/admin/share/' + code, { method: 'DELETE', headers: { 'Content-Type': 'application/json' } });
       toast('已删除');
       loadAdmin();
     } catch (e) { toast(e.message); }

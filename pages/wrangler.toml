@@ -1,0 +1,8 @@
+name = "filecodebox-cf"
+pages_build_output_dir = "../.wrangler/pages-dist"
+compatibility_date = "2026-10-24"
+
+# Pages 只提供前端与同源转发。D1 和 Telegram 密钥仅绑定到原 Worker。
+[[services]]
+binding = "BACKEND"
+service = "filecodebox-cf"
