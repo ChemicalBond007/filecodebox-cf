@@ -53,6 +53,10 @@ async function mockTelegram(urlStr, opts) {
   }
   if (sub === '/getFile') {
     const id = u.searchParams.get('file_id');
+    // 与官方 Bot API 的 20MiB 下载硬上限一致，不随项目 CHUNK_SIZE 放宽。
+    if (tgStore.get(id)?.bytes.length > 20 * 1024 * 1024) {
+      return Response.json({ ok: false, description: 'Bad Request: file is too big' }, { status: 400 });
+    }
     if (tgStore.has(id)) return new Response(JSON.stringify({ ok: true, result: { file_path: 'tgfiles/' + id } }), { headers: { 'Content-Type': 'application/json' } });
     return new Response(JSON.stringify({ ok: false, description: 'not found' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
   }

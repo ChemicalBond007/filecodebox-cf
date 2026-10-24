@@ -93,11 +93,12 @@ const ROUTES = [
     const index = Number.parseInt(String(form.get('index') ?? '0'), 10);
     const fileName = String(form.get('fileName') || `part${String(index).padStart(3, '0')}`).slice(0, 255);
     if (!Number.isInteger(index) || index < 0) return api.json({ error: '分片序号无效' }, 400);
-    if (!file) return api.json({ error: '分片为空' }, 400);
+    if (!file || typeof file === 'string') return api.json({ error: '分片必须为文件' }, 400);
     try {
       const r = await telegram.uploadChunk(env, file, fileName, index);
       return api.json({ success: true, index, ...r });
     } catch (e) {
+      if (e instanceof RangeError) return api.json({ error: e.message }, 413);
       console.error('[chunk upload]', e);
       return api.json({ error: '分片上传失败' }, 500);
     }

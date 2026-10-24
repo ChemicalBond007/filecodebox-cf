@@ -8,6 +8,7 @@
   let state = {
     type: 'text',
     file: null,
+    sending: false,
   };
   // 清除旧版本长期令牌。管理员凭证只保存在 HttpOnly Cookie 中。
   try { localStorage.removeItem('fcb_admin_token'); } catch { /* 存储被禁用 */ }
@@ -73,7 +74,9 @@
   );
   $$('.seg-btn').forEach((b) =>
     b.addEventListener('click', () => {
+      if (state.sending) return;
       state.type = b.dataset.type;
+      resetUploadProgress();
       $$('.seg-btn').forEach((x) => x.classList.toggle('active', x === b));
       $('#pane-text').classList.toggle('hidden', state.type !== 'text');
       $('#pane-file').classList.toggle('hidden', state.type !== 'file');
@@ -89,10 +92,10 @@
   // ---------- 文件选择 ----------
   const dz = $('#dropzone');
   const fileInput = $('#fileInput');
-  dz.addEventListener('click', () => fileInput.click());
+  dz.addEventListener('click', () => { if (!state.sending) fileInput.click(); });
   fileInput.addEventListener('change', () => setFile(fileInput.files[0]));
   ['dragover', 'dragenter'].forEach((ev) =>
-    dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add('drag'); })
+    dz.addEventListener(ev, (e) => { e.preventDefault(); if (!state.sending) dz.classList.add('drag'); })
   );
   ['dragleave', 'drop'].forEach((ev) =>
     dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.remove('drag'); })
@@ -104,7 +107,10 @@
   $('#fileClear').addEventListener('click', () => setFile(null));
 
   function setFile(f) {
+    if (state.sending) return;
     state.file = f || null;
+    resetUploadProgress();
+    $('#sendResult').classList.add('hidden');
     if (f) {
       $('#fcName').textContent = f.name;
       $('#fcSize').textContent = fmtSize(f.size);
@@ -115,46 +121,127 @@
     }
   }
 
+  // ---------- 上传进度 ----------
+  let uploadProgress = null;
+  function resetUploadProgress() {
+    uploadProgress = null;
+    $('#uploadProgress').classList.add('hidden');
+    $('#uploadProgress').dataset.status = '';
+    $('#uploadProgressBar').value = 0;
+    $('#uploadProgressPercent').textContent = '0%';
+    $('#uploadProgressStatus').textContent = '';
+    $('#uploadProgressDetail').textContent = '';
+  }
+  function startUploadProgress(file) {
+    uploadProgress = { loaded: 0, total: file.size };
+    $('#uploadProgress').classList.remove('hidden');
+    $('#uploadProgress').dataset.status = 'uploading';
+    updateUploadProgress(0, '准备上传…');
+  }
+  function updateUploadProgress(loaded, status, complete = false) {
+    if (!uploadProgress) return;
+    const p = uploadProgress;
+    p.loaded = Math.max(p.loaded, Math.min(p.total, Math.max(0, loaded)));
+    const percent = complete ? 100 : p.total ? Math.floor(p.loaded / p.total * 100) : 0;
+    $('#uploadProgressBar').value = percent;
+    $('#uploadProgressPercent').textContent = `${percent}%`;
+    if ($('#uploadProgressStatus').textContent !== status) $('#uploadProgressStatus').textContent = status;
+    $('#uploadProgressDetail').textContent = `${fmtSize(p.loaded)} / ${fmtSize(p.total)}`;
+  }
+  function setSending(sending) {
+    state.sending = sending;
+    $('#sendBtn').disabled = sending;
+    $('#sendBtn').textContent = sending ? '处理中…' : '生成取件码';
+    ['#fileInput', '#fileClear', '#textInput', '#expireSel', '#dlSel', '#pwdInput']
+      .forEach(id => { $(id).disabled = sending; });
+    $$('.seg-btn').forEach(b => { b.disabled = sending; });
+    dz.setAttribute('aria-disabled', String(sending));
+    if (sending) dz.classList.remove('drag');
+  }
+
+  // fetch 不提供上传进度事件，仅上传请求使用 XHR；其它 API 仍复用 api()。
+  function uploadApi(path, form, onProgress, onSent) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', path);
+      xhr.responseType = 'json';
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable && event.total > 0) {
+          onProgress(Math.min(1, Math.max(0, event.loaded / event.total)));
+        }
+      };
+      xhr.upload.onload = onSent;
+      xhr.onload = () => {
+        const data = xhr.response;
+        if (xhr.status < 200 || xhr.status >= 300) {
+          reject(new Error((data && data.error) || `上传失败 (${xhr.status})`));
+        } else if (!data || typeof data !== 'object') {
+          reject(new Error('上传响应无效，请重试'));
+        } else {
+          resolve(data);
+        }
+      };
+      xhr.onerror = () => reject(new Error('网络异常，文件上传失败，请重试'));
+      xhr.onabort = () => reject(new Error('上传已取消'));
+      xhr.ontimeout = () => reject(new Error('上传超时，请重试'));
+      xhr.send(form);
+    });
+  }
+
   // ---------- 寄件 ----------
   $('#sendBtn').addEventListener('click', async () => {
-    const btn = $('#sendBtn');
-    btn.disabled = true; btn.textContent = '生成中…';
+    if (state.sending) return;
+    const type = state.type;
+    const file = state.file;
+    setSending(true);
+    resetUploadProgress();
+    $('#sendResult').classList.add('hidden');
     try {
       const fd = new FormData();
-      fd.set('type', state.type);
+      fd.set('type', type);
       fd.set('expire_ms', $('#expireSel').value);
       fd.set('download_limit', $('#dlSel').value);
       const pwd = $('#pwdInput').value.trim();
       if (pwd) fd.set('password', pwd);
 
-      if (state.type === 'text') {
+      if (type === 'text') {
         const text = $('#textInput').value;
         if (!text.trim()) throw new Error('文本内容不能为空');
         fd.set('text', text);
       } else {
-        if (!state.file) throw new Error('请先选择文件');
-        // 文件上传：Telegram 模式下大文件（>20MB）走客户端分块（init→逐片→merge），
+        if (!file) throw new Error('请先选择文件');
+        startUploadProgress(file);
+        // 文件上传：Telegram 模式下大文件（>20MiB）走客户端分块（init→逐片→merge），
         // 绕过 Cloudflare Worker 请求体/CPU 限制；其余走 /api/imgbed/upload（ImgBed 模式或 Telegram 小文件）。
-        const up = await uploadFileKey(state.file);
+        const up = await uploadFileKey(file);
         if (!up.id || !up.upload_token) throw new Error('存储后端未返回文件凭证');
         fd.set('file_key', up.id);
         fd.set('upload_token', up.upload_token);
-        fd.set('file_name', state.file.name);
-        fd.set('file_type', state.file.type || 'application/octet-stream');
-        fd.set('file_size', String(state.file.size));
+        fd.set('file_name', file.name);
+        fd.set('file_type', file.type || 'application/octet-stream');
+        fd.set('file_size', String(file.size));
+        updateUploadProgress(file.size, '文件上传完成，正在生成取件码…');
       }
 
       const data = await api('/api/share', { method: 'POST', body: fd });
       showSendResult(data);
+      if (uploadProgress) {
+        updateUploadProgress(file.size, '上传完成，取件码已生成', true);
+        $('#uploadProgress').dataset.status = 'complete';
+      }
     } catch (e) {
+      if (uploadProgress) {
+        $('#uploadProgress').dataset.status = 'error';
+        $('#uploadProgressStatus').textContent = `未完成：${e.message}`;
+      }
       toast(e.message);
     } finally {
-      btn.disabled = false; btn.textContent = '生成取件码';
+      setSending(false);
     }
   });
 
   // 文件上传：返回 { id, upload_token }（id 即分享用的 file_key，upload_token 证明来源）。
-  // Telegram 模式且文件 > 20MB 时走客户端分块上传（复用 ImgBed 的 init→chunk→merge 协议），
+  // Telegram 模式且文件 > 20MiB 时走客户端分块上传（复用 ImgBed 的 init→chunk→merge 协议），
   // 否则直接 /api/imgbed/upload（ImgBed 模式流式代理，或 Telegram 小文件单发）。
   async function uploadFileKey(file) {
     const isTG = state.storage === 'Telegram (Bot API)';
@@ -163,13 +250,16 @@
     }
     const upForm = new FormData();
     upForm.set('file', file);
-    return await api('/api/imgbed/upload', { method: 'POST', body: upForm });
+    return await uploadApi('/api/imgbed/upload', upForm,
+      fraction => updateUploadProgress(file.size * fraction, '正在上传文件…'),
+      () => updateUploadProgress(file.size, '数据已发送，等待存储确认…'));
   }
 
-  // 客户端分块上传（与 CloudFlare-ImgBed 一致）：每片 16MB，逐片 POST /api/chunk/upload，
+  // 客户端分块上传：从 init 获取分片大小（当前 20MiB），逐片 POST /api/chunk/upload，
   // 最后 POST /api/chunk/merge 汇总各片元信息，得到分片 file_key。
   async function uploadChunked(file) {
     const { chunkSize } = await api('/api/chunk/init', { method: 'POST' });
+    if (!Number.isSafeInteger(chunkSize) || chunkSize <= 0) throw new Error('无效的上传分片大小');
     const total = Math.max(1, Math.ceil(file.size / chunkSize));
     const chunks = [];
     for (let i = 0; i < total; i++) {
@@ -181,8 +271,13 @@
       fd.set('file', blob);
       fd.set('index', String(i));
       fd.set('fileName', fileName);
-      const r = await api('/api/chunk/upload', { method: 'POST', body: fd });
+      const label = `正在上传分片 ${i + 1}/${total}…`;
+      updateUploadProgress(start, label);
+      const r = await uploadApi('/api/chunk/upload', fd,
+        fraction => updateUploadProgress(start + blob.size * fraction, label),
+        () => updateUploadProgress(end, `分片 ${i + 1}/${total} 已发送，等待存储确认…`));
       if (!r.success || !r.chunkToken) throw new Error(`分片 ${i + 1}/${total} 上传失败`);
+      updateUploadProgress(end, `分片 ${i + 1}/${total} 上传完成`);
       chunks.push({
         index: i,
         fileId: r.fileId,
@@ -191,6 +286,7 @@
         chunkToken: r.chunkToken,
       });
     }
+    updateUploadProgress(file.size, '正在合并分片，请稍候…');
     return await api('/api/chunk/merge', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

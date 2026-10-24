@@ -86,6 +86,16 @@
 
       <button class="primary-btn" id="sendBtn">生成取件码</button>
 
+      <div class="upload-progress hidden" id="uploadProgress">
+        <div class="upload-progress-head">
+          <span id="uploadProgressStatus" role="status" aria-live="polite">准备上传…</span>
+          <span id="uploadProgressPercent">0%</span>
+        </div>
+        <progress id="uploadProgressBar" max="100" value="0" aria-label="文件上传进度" aria-describedby="uploadProgressStatus uploadProgressDetail"></progress>
+        <p id="uploadProgressDetail"></p>
+        <p class="upload-progress-hint">显示浏览器发送进度；发送完毕后仍需等待存储确认和取件码生成。</p>
+      </div>
+
       <div class="result hidden" id="sendResult">
         <div class="result-head">✅ 已生成取件码</div>
         <div class="code-box">

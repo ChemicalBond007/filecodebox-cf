@@ -147,22 +147,22 @@ npm run pages:deploy
 ### 行为
 
 - **上传**：
-  - **大文件（> 20MB）走客户端分块**：前端把文件切成 16MB 小片，逐片经 `/api/chunk/upload` 单独 `sendDocument` 到 Telegram，最后 `/api/chunk/merge` 校验各片 `chunkToken` 并汇总成 `c:` 的 `file_key`。这样大文件**不必一次性推到 Worker**，从而绕过 Cloudflare 的请求体 / CPU 限制；分片数有 1000 片防护上限，受 1 小时会话超时与上传速度约束。
-  - **小文件（≤ 20MB）**：前端经 `/api/imgbed/upload` 单发；若整文件 > 16MB，服务端也会兜底自动分片（同上的 `c:` 格式），向后兼容旧调用方式。
+  - **大文件（> 20MiB）走客户端分块**：前端从 `/api/chunk/init` 获取分片大小，每片最多 20MiB，逐片经 `/api/chunk/upload` 单独 `sendDocument` 到 Telegram，最后 `/api/chunk/merge` 校验各片 `chunkToken` 并汇总成 `c:` 的 `file_key`。这样大文件**不必一次性推到 Worker**，从而避开整文件请求过大的问题；分片数有 1000 片防护上限，仍受元数据长度、会话超时与上传速度约束。
+  - **小文件（≤ 20MiB）**：前端经 `/api/imgbed/upload` 单发；服务端也会对超过 20MiB 的旧式整文件上传兜底自动分片。
 - **取件**：`/file/:key?c=CODE&t=TOKEN` 先校验 10 分钟短时 token 和分享状态，再在服务端用 bot token 调 `getFile` 取回字节并流式返回。**bot token 始终留在服务端，不会下发给浏览器**（与 ImgBed 的 302 不同，这里不暴露任何 token，更安全）。分片文件按序串联各片返回，支持 `Range`（视频拖动）与 `HEAD`；响应强制 `attachment` + `application/octet-stream`。
 - **文件名**：含中文等非 ASCII 字符时按 RFC 5987 用 `filename*` 编码，浏览器能正确下载出中文名。
 - **删除**：删除分享时**不会**清理 Telegram 侧消息（文件仍保留在频道/群里），介意的话定期清理频道即可。
 
-> ⚠️ **大小限制**（对齐 CloudFlare-ImgBed 的 Telegram 存储口径）：
+> ⚠️ **大小限制**（20MiB = 20 × 1024 × 1024 = 20,971,520 字节，顶到 Telegram 官方 `getFile` 上限，不再预留 4MiB 余量）：
 >
 > | 场景 | 限制 |
 > |------|------|
-> | 单文件上传 | 16MB（安全阈值）/ 20MB（Telegram Bot API 硬限，确保可整文件经 `getFile` 取回） |
-> | 分片上传 | 每片 ≤ 16MB，最多 1000 片（受 1 小时会话超时与上传速度约束） |
-> | 单文件下载 | 20MB（`getFile` 限制） |
-> | 分片下载 | **无限制**（逐片 `getFile` 拼接，支持 `Range` / `HEAD`） |
+> | 本项目单文件上传 | ≤ 20MiB，确保可整文件经 `getFile` 取回（Telegram `sendDocument` 的 50MB 上传上限不适用于下载） |
+> | 分片上传 | 每片 ≤ 20MiB，超限分片返回 413；最多 1000 片，仍受其他平台与元数据限制 |
+> | 单文件下载 | ≤ 20MiB（`getFile` 限制） |
+> | 分片下载 | 逐片 `getFile` 拼接，支持 `Range` / `HEAD`，不受整文件 20MiB 限制 |
 >
-> 超过 16MB 的文件自动分片，分片元信息编码进 `file_key`（无需额外存储），取件时按序流式重组。大文件（> 20MB）由前端**客户端分块上传**（`init → 逐片 /api/chunk/upload → /api/chunk/merge`，每片 16MB），逐片独立请求，不受 Cloudflare Worker 请求体 / CPU 限制；代码设置 1000 片防护上限。需要超大文件或更高吞吐时，ImgBed 后端（R2）同样可用、且无此约束。
+> 大文件由前端**客户端分块上传**（`init → 逐片 /api/chunk/upload → /api/chunk/merge`，每片 20MiB），逐片独立请求；服务端为旧式整文件上传保留自动分片。分片元信息编码进 `file_key`，取件时依据每片实际大小重组，不依赖当前分片常量，因此旧的 16MiB 分片分享无需迁移。分片不能绕过平台所有限制，例如请求大小、CPU、元数据长度与令牌有效期。
 
 ### 本地调试（mock Telegram）
 
@@ -197,7 +197,7 @@ BASE=http://127.0.0.1:8088 node tg_e2e_test.mjs  # 上传→分享→取件→�
 |------|------|------|
 | `POST` | `/api/share` | 创建分享。`multipart`：`type=text\|file`、`text`、`file_key`+`upload_token`+`file_name`+`file_type`+`file_size`（文件先经 `/api/imgbed/upload` 上传，`upload_token` 由上传接口返回）、`expire_ms`、`download_limit`、`password` |
 | `POST` | `/api/imgbed/upload` | 文件上传入口（小文件）。Telegram 模式直发 Bot API `sendDocument`；ImgBed 模式流式代理到其 `/upload`。返回 `{ id, src, upload_token }`（`id` 即文件 key，`upload_token` 1 小时有效） |
-| `POST` | `/api/chunk/init` | 客户端分块上传初始化（仅 Telegram 模式），返回 `{ chunkSize }`（当前 16MB） |
+| `POST` | `/api/chunk/init` | 客户端分块上传初始化（仅 Telegram 模式），返回 `{ chunkSize }`（当前 20971520 字节，即 20MiB） |
 | `POST` | `/api/chunk/upload` | 上传单个分片（仅 Telegram 模式）。`multipart`：`file` + `index` + `fileName`，返回 `{ success, index, fileId, size, fileName, chunkToken }`（`chunkToken` 1 小时有效） |
 | `POST` | `/api/chunk/merge` | 汇总分片元信息（仅 Telegram 模式）。`json`：`{ fileName, fileType, totalChunks, chunks }`（`chunks` 必须带 `chunkToken`），返回 `{ id, src, upload_token }`（`id` 即分片 `file_key`，形如 `c:...`） |
 | `GET` | `/api/share/:code` | 分享元信息（不消耗） |
