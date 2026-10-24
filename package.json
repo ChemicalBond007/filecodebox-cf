@@ -1,7 +1,7 @@
 {
   "name": "filecodebox-cf",
   "version": "1.0.0",
-  "description": "FileCodeBox 的 Cloudflare 移植版，存储后端复用 CloudFlare-ImgBed (R2 + D1)",
+  "description": "FileCodeBox 的 Cloudflare Workers 移植版：D1 + Telegram / CloudFlare-ImgBed 存储，Passkey 管理",
   "type": "module",
   "private": true,
   "scripts": {
@@ -18,7 +18,6 @@
     "pages:deploy": "wrangler pages deploy --cwd pages --project-name filecodebox-cf --branch main --commit-dirty=true"
   },
   "devDependencies": {
-    "playwright-core": "^1.62.0",
     "wrangler": "^4.152.0"
   },
   "dependencies": {
