@@ -3,22 +3,55 @@
 // 路由说明：
 //   /api/share            POST  创建分享（文本 / 文件）
 //   /api/share/:code      GET   查看分享元信息（不消耗）
-//   /api/share/:code/claim POST 取件（消耗一次，文本直接返回 / 文件返回防直链 URL）
+//   /api/share/:code/claim POST 取件（消耗一次，文本直接返回 / 文件返回短时防直链 URL）
 //   /api/imgbed/upload    POST  把文件流式代理到 ImgBed 的 /upload（原生支持大文件）
-//   /file/:key?t=TOKEN    GET   校验防直链 token 后：ImgBed 模式 302 跳转；Telegram 模式服务端取回字节返回
-//   /api/admin/login      POST  管理员登录，返回 token
-//   /api/admin/stats      GET   统计
-//   /api/admin/shares     GET   分享列表
-//   /api/admin/share/:code DELETE 删除某分享（同步清理 ImgBed 侧对象）
-//   /api/admin/sweep      POST  清理过期 / 超额分享
-//   /api/install         GET/POST  首次部署初始化 D1 表结构（幂等，也可由首次访问自动建表）
-//   /api/config           GET   前端公共配置
-//   /api/health           GET   健康检查
+//   /file/:key?c=&t=      GET   校验短时 token + 分享状态后：ImgBed 302 / Telegram 服务端取回
+//   /api/admin/*          *     管理接口（Bearer；未配置 ADMIN_KEY 时不再有默认密钥）
+//   /api/install          GET/POST 初始化 D1（幂等）
+//   /api/config、/api/health
+//
+// 安全要点：
+//   · 管理员 token / 文件 token / 上传 token 均使用恒定时间比较且带过期时间
+//   · 文件响应统一 attachment + nosniff，避免上传 HTML/SVG 后在本站同源执行
+//   · 管理接口不加通配 CORS；公开 API 保留 CORS
 
 import * as api from './api.js';
 import * as storage from './storage.js';
 import * as db from './db.js';
 import * as telegram from './telegram.js';
+import { isValidFileKey } from './auth.js';
+
+const CSP = [
+  "default-src 'self'",
+  "script-src 'self'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: blob:",
+  "media-src 'self' blob:",
+  "connect-src 'self'",
+  "font-src 'self'",
+  "object-src 'none'",
+  "base-uri 'none'",
+  "form-action 'self'",
+  "frame-ancestors 'none'",
+].join('; ');
+
+function withSecurityHeaders(res, { cors = false, noStore = false } = {}) {
+  const headers = new Headers(res.headers);
+  headers.set('X-Content-Type-Options', 'nosniff');
+  headers.set('X-Frame-Options', 'DENY');
+  headers.set('Referrer-Policy', 'no-referrer');
+  headers.set('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  headers.set('Content-Security-Policy', CSP);
+  headers.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  headers.set('Cross-Origin-Opener-Policy', 'same-origin');
+  if (cors) {
+    headers.set('Access-Control-Allow-Origin', '*');
+  } else {
+    headers.delete('Access-Control-Allow-Origin');
+  }
+  if (noStore) headers.set('Cache-Control', 'no-store');
+  return new Response(res.body, { status: res.status, headers });
+}
 
 // 编译 "/api/share/:code/claim" -> 正则 + 参数名
 function compile(pattern) {
@@ -42,18 +75,13 @@ const ROUTES = [
     const r = (env.TG_BOT_TOKEN && env.TG_CHAT_ID)
       ? await telegram.uploadToTelegram(env, ctx.request)
       : await storage.uploadToImgBed(env, ctx.request);
-    return new Response(JSON.stringify(r), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json; charset=utf-8' },
-    });
+    return api.json(r);
   } },
-  // 客户端分块上传（init → 逐片 /api/chunk/upload → /api/chunk/merge），仅在 Telegram 模式可用：
-  // 前端把大文件切成 16MB 的小片逐片发来，Worker 每片单独 sendDocument 到 Telegram，
-  // 最后 merge 把各片元信息组装成 c: 的 file_key，从而绕过 Cloudflare Worker 请求体/CPU 限制。
+  // 客户端分块上传（init → 逐片 /api/chunk/upload → /api/chunk/merge），仅在 Telegram 模式可用。
   { method: 'POST', pattern: '/api/chunk/init', handler: async (ctx) => {
     const { env } = ctx;
     if (!(env.TG_BOT_TOKEN && env.TG_CHAT_ID)) return api.json({ error: '未启用 Telegram 存储' }, 400);
-    return api.json({ chunkSize: CHUNK_SIZE });
+    return api.json({ chunkSize: telegram.CHUNK_SIZE });
   } },
   { method: 'POST', pattern: '/api/chunk/upload', handler: async (ctx) => {
     const { env } = ctx;
@@ -61,14 +89,16 @@ const ROUTES = [
     let form;
     try { form = await ctx.request.formData(); } catch (e) { return api.json({ error: '无效的分片上传请求' }, 400); }
     const file = form.get('file');
-    const index = parseInt(form.get('index') || '0', 10);
-    const fileName = form.get('fileName') || `part${String(index).padStart(3, '0')}`;
+    const index = Number.parseInt(String(form.get('index') ?? '0'), 10);
+    const fileName = String(form.get('fileName') || `part${String(index).padStart(3, '0')}`).slice(0, 255);
+    if (!Number.isInteger(index) || index < 0) return api.json({ error: '分片序号无效' }, 400);
     if (!file) return api.json({ error: '分片为空' }, 400);
     try {
-      const r = await telegram.uploadChunk(env, file, fileName);
-      return api.json({ success: true, index, fileId: r.fileId, size: r.size, fileName: r.fileName });
+      const r = await telegram.uploadChunk(env, file, fileName, index);
+      return api.json({ success: true, index, ...r });
     } catch (e) {
-      return api.json({ error: e.message }, 500);
+      console.error('[chunk upload]', e);
+      return api.json({ error: '分片上传失败' }, 500);
     }
   } },
   { method: 'POST', pattern: '/api/chunk/merge', handler: async (ctx) => {
@@ -76,26 +106,36 @@ const ROUTES = [
     if (!(env.TG_BOT_TOKEN && env.TG_CHAT_ID)) return api.json({ error: '未启用 Telegram 存储' }, 400);
     const body = await ctx.request.json().catch(() => ({}));
     const chunks = body.chunks;
-    if (!Array.isArray(chunks) || !chunks.length) return api.json({ error: '分片列表为空' }, 400);
     try {
-      const id = telegram.assembleChunkedKey(chunks);
-      return api.json({ id, src: `tg://chunked:${chunks.length}` });
+      const r = await telegram.verifyAndAssembleChunkedKey(env, chunks);
+      const count = Array.isArray(chunks) ? chunks.length : 0;
+      return api.json({ id: r.id, src: `tg://chunked:${count}`, upload_token: r.upload_token });
     } catch (e) {
-      return api.json({ error: e.message }, 500);
+      return api.json({ error: '分片校验失败：' + e.message }, 400);
     }
   } },
   { method: 'GET', pattern: '/api/share/:code', handler: api.getShareMeta },
   { method: 'POST', pattern: '/api/share/:code/claim', handler: api.claimShare },
   { method: 'GET', pattern: '/file/:key', handler: async (ctx) => {
-    const { env } = ctx;
-    if (env.TG_BOT_TOKEN && env.TG_CHAT_ID) {
-      const row = await db.getShareByFileKey(env.fcb_db, ctx.params.key);
-      return telegram.serveFromTelegram(
-        env, ctx.request, ctx.params.key,
-        row ? { file_name: row.file_name, file_type: row.file_type } : null
-      );
+    const { env, request, params } = ctx;
+    const key = params.key;
+    const code = new URL(request.url).searchParams.get('c') || '';
+
+    if (!code) return api.json({ error: '无效或缺失的访问凭证' }, 403);
+    if (!isValidFileKey(key)) return api.json({ error: '无效的文件标识' }, 400);
+
+    const row = await db.getShare(env.fcb_db, code);
+    if (!row || row.type !== 'file' || row.file_key !== key) {
+      return api.json({ error: '文件不存在或已失效' }, 404);
     }
-    return storage.serveFromImgBed(env, ctx.request, ctx.params.key);
+    if (api.isExpired(row)) return api.json({ error: '该分享已过期' }, 410);
+
+    // 注：claim 已原子扣减一次；这里不能再按 downloads >= download_limit 拒绝，
+    // 否则 download_limit=1 的首次下载会被误伤。token 本身 10 分钟后过期。
+    if (env.TG_BOT_TOKEN && env.TG_CHAT_ID) {
+      return telegram.serveFromTelegram(env, request, key, code, row);
+    }
+    return storage.serveFromImgBed(env, request, key, code);
   } },
   { method: 'POST', pattern: '/api/admin/login', handler: api.adminLogin },
   { method: 'GET', pattern: '/api/admin/stats', handler: api.adminStats },
@@ -121,55 +161,72 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const pathname = url.pathname;
-    let method = request.method.toUpperCase();
+    const method = request.method.toUpperCase();
+    const adminPath = pathname.startsWith('/api/admin');
+    const noStore = pathname.startsWith('/api/') || pathname.startsWith('/file/');
+    const cors = !adminPath && (pathname.startsWith('/api/') || pathname.startsWith('/file/'));
 
     // HEAD 复用 GET 路由（文件服务支持 HEAD）
     const lookupMethod = method === 'HEAD' ? 'GET' : method;
-    const found = match(lookupMethod, pathname);
+    let found;
+    try {
+      found = match(lookupMethod, pathname);
+    } catch (e) {
+      return withSecurityHeaders(api.json({ error: '非法请求' }, 400), { cors, noStore });
+    }
 
     if (found) {
       const context = { request, env, ctx, params: found.params };
       try {
         const res = await found.handler(context);
-        // 统一附加 CORS（按需，默认开放）
-        const headers = new Headers(res.headers);
-        headers.set('Access-Control-Allow-Origin', '*');
-        if (method === 'HEAD') {
-          return new Response(null, { status: res.status, headers });
-        }
-        return new Response(res.body, { status: res.status, headers });
+        const out = method === 'HEAD'
+          ? new Response(null, { status: res.status, headers: res.headers })
+          : res;
+        return withSecurityHeaders(out, { cors, noStore });
       } catch (e) {
-        return new Response(JSON.stringify({ error: '服务器错误：' + e.message }), {
-          status: 500,
-          headers: { 'Content-Type': 'application/json; charset=utf-8' },
-        });
+        console.error('[worker]', e);
+        const err = api.json({ error: '服务器错误' }, 500);
+        const out = method === 'HEAD'
+          ? new Response(null, { status: err.status, headers: err.headers })
+          : err;
+        return withSecurityHeaders(out, { cors, noStore });
       }
     }
 
     // 预检
     if (method === 'OPTIONS') {
-      return new Response(null, {
-        status: 204,
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-        },
-      });
+      const headers = new Headers();
+      if (cors) {
+        headers.set('Access-Control-Allow-Origin', '*');
+        headers.set('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
+        headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+        headers.set('Access-Control-Max-Age', '86400');
+      }
+      headers.set('Allow', 'GET,POST,DELETE,OPTIONS');
+      return withSecurityHeaders(new Response(null, { status: 204, headers }), { cors, noStore });
+    }
+
+    // 未匹配的 /api/* 返回 JSON 404，而不是 SPA HTML
+    if (pathname.startsWith('/api/')) {
+      return withSecurityHeaders(api.json({ error: 'Not Found' }, 404), { cors: false, noStore: true });
     }
 
     // 其余交给静态资源（SPA）
     if (env.ASSETS) {
-      return env.ASSETS.fetch(request);
+      const res = await env.ASSETS.fetch(request);
+      return withSecurityHeaders(res, { cors: false });
     }
-    return new Response('Not Found', { status: 404 });
+    return withSecurityHeaders(new Response('Not Found', { status: 404 }), {});
   },
 
   // Cron Trigger：定期清理过期 / 超额分享
   async scheduled(event, env, ctx) {
     const keys = await db.sweepExpired(env.fcb_db, Date.now());
-    for (const k of keys) {
-      ctx.waitUntil(storage.deleteFromImgBed(env, k));
+    for (const k of [...new Set(keys)]) {
+      ctx.waitUntil((async () => {
+        const remaining = await db.countSharesByFileKey(env.fcb_db, k);
+        if (remaining === 0) await storage.deleteFromImgBed(env, k);
+      })());
     }
   },
 };

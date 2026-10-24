@@ -1,6 +1,6 @@
 name = "filecodebox-cf"
 main = "src/worker.js"
-compatibility_date = "2024-11-01"
+compatibility_date = "2026-10-24"
 
 # 静态前端（SPA）：/public 下的 index.html / styles.css / app.js
 [assets]
@@ -11,13 +11,19 @@ not_found_handling = "single-page-application"
 # ===== 绑定与变量全部在 Cloudflare 控制台（网页面板）完成，本文件不写死任何密钥或占位符 =====
 # 部署后请在面板做两件事：
 # 1) 绑定 D1：控制台创建名为 filecodebox 的 D1 数据库，绑定到本 Worker，变量名填 fcb_db；
-#    再到该 D1 的 Console 执行 migrations/0001_init.sql 里的建表语句。
+#    表结构会在首次访问时自动创建（幂等）；migrations/0001_init.sql 仅作离线参考。
 # 2) 设置变量（Worker → Settings → Variables and Secrets）：
-#    IMG_BED_URL   必填，已部署的 CloudFlare-ImgBed 地址，如 https://img.example.com
-#    ADMIN_KEY     必填（建议用 Secret 类型），管理后台密码
+#    IMG_BED_URL     必填，已部署的 CloudFlare-ImgBed 地址，如 https://img.example.com
+#    ADMIN_API_TOKEN 推荐（Secret），管理接口 Bearer token；可与 ADMIN_KEY 二选一
+#    ADMIN_KEY       可选（Secret），管理后台密码；未配置时不再回退默认密钥
+#    FILE_SECRET     强烈建议（Secret），文件/上传/分片 token 的 HMAC 密钥
 #    APP_NAME / APP_SUBTITLE  可选，界面展示文案（不填则用内置默认值）
 #    IMG_BED_UPLOAD_TOKEN / IMG_BED_UPLOAD_TOKEN_PARAM / IMG_BED_UPLOAD_CHANNEL / IMG_BED_ADMIN_TOKEN  可选
 # 注：本仓库不提交任何敏感信息或占位符，所有配置在面板填写，避免误泄露密钥。
+
+# 可观测性（Workers Logs）；按需开启 traces
+[observability]
+enabled = true
 
 # 定时清理过期 / 超额分享（Cron Trigger）
 [triggers]

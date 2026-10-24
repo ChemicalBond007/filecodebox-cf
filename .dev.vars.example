@@ -1,3 +1,4 @@
+# 至少设置 ADMIN_API_TOKEN 或 ADMIN_KEY 之一；FILE_SECRET 强烈建议单独设置。
 ADMIN_KEY=your-local-admin-key
 ADMIN_API_TOKEN=your-local-admin-api-token
 FILE_SECRET=your-local-file-secret

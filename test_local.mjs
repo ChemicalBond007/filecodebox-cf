@@ -1,11 +1,12 @@
-// ±¾µØ¼¯³É²âÊÔ£ºÓÃ node:sqlite Ä£Äâ D1£¬ÓÃ globalThis.fetch À¹½Ø²¢Ä£Äâ
-// CloudFlare-ImgBed µÄ HTTP API£¨/upload¡¢/file¡¢/api/manage/delete£©¡£
-// ¸²¸Ç Phase 3 ¼Ü¹¹£ºÎÄ¼ş¶ş½øÖÆÎ¯ÍĞ¸øÒÑ²¿ÊğµÄ ImgBed£¬±¾ Worker Ö»×öÈ¡¼şÂë²ã¡£
+// æœ¬åœ°é›†æˆæµ‹è¯•ï¼šç”¨ node:sqlite æ¨¡æ‹Ÿ D1ï¼Œç”¨ globalThis.fetch æ‹¦æˆªå¹¶æ¨¡æ‹Ÿ
+// CloudFlare-ImgBed çš„ HTTP APIï¼ˆ/uploadã€/fileã€/api/manage/deleteï¼‰ã€‚
+// è¦†ç›– Phase 3 æ¶æ„ï¼šæ–‡ä»¶äºŒè¿›åˆ¶å§”æ‰˜ç»™å·²éƒ¨ç½²çš„ ImgBedï¼Œæœ¬ Worker åªåšå–ä»¶ç å±‚ã€‚
 import { DatabaseSync } from 'node:sqlite';
 import { readFileSync } from 'node:fs';
 import worker from './src/worker.js';
+import { hmac, fileToken } from './src/auth.js';
 
-// ---- ÄÚ´æ SQLite Ä£Äâ D1£¨½ö fcb_db£¬·ÖÏíÔªÊı¾İ£© ----
+// ---- å†…å­˜ SQLite æ¨¡æ‹Ÿ D1ï¼ˆä»… fcb_dbï¼Œåˆ†äº«å…ƒæ•°æ®ï¼‰ ----
 const sqlite = new DatabaseSync(':memory:');
 sqlite.exec(readFileSync(new URL('./migrations/0001_init.sql', import.meta.url), 'utf8'));
 
@@ -15,15 +16,18 @@ class Stmt {
   _all() { return this.db.prepare(this.q).all(...this.params); }
   first() { const r = this._all(); return r.length ? r[0] : null; }
   all() { return { results: this._all() }; }
-  run() { this.db.prepare(this.q).run(...this.params); return { success: true, meta: {} }; }
+  run() {
+    const info = this.db.prepare(this.q).run(...this.params);
+    return { success: true, meta: { changes: Number(info.changes || 0) } };
+  }
 }
 const fcb_db = { prepare: (q) => new Stmt(sqlite, q) };
 
-// ---- Ä£Äâ CloudFlare-ImgBed µÄ HTTP API ----
+// ---- æ¨¡æ‹Ÿ CloudFlare-ImgBed çš„ HTTP API ----
 const IMG_BED_URL = 'https://imgbed.test';
 const uploaded = {}; // id -> { bytes, contentType }
 let uploadCounter = 0;
-let deletedIds = []; // ¼ÇÂ¼±» /api/manage/delete ÇåÀí¹ıµÄ id
+let deletedIds = []; // è®°å½•è¢« /api/manage/delete æ¸…ç†è¿‡çš„ id
 
 async function streamToText(stream) {
   if (!stream) return '';
@@ -42,7 +46,7 @@ async function streamToText(stream) {
   return String(stream);
 }
 
-// Ä£Äâ ImgBed£º´Ó×ª·¢µÄ multipart/form-data ÖĞ½âÎö³öÎÄ¼ş±¾Ìå£¨ÓëÕæÊµ ImgBed ĞĞÎªÒ»ÖÂ£©
+// æ¨¡æ‹Ÿ ImgBedï¼šä»è½¬å‘çš„ multipart/form-data ä¸­è§£æå‡ºæ–‡ä»¶æœ¬ä½“ï¼ˆä¸çœŸå® ImgBed è¡Œä¸ºä¸€è‡´ï¼‰
 function parseMultipartFile(body, contentType) {
   const m = /boundary=(.*?)(;|$)/.exec(contentType || '');
   if (!m) return body;
@@ -63,7 +67,7 @@ function parseMultipartFile(body, contentType) {
 async function mockFetch(url, init = {}) {
   const u = new URL(url);
   if (!u.origin.endsWith('imgbed.test')) {
-    throw new Error('·ÇÔ¤ÆÚµÄ fetch Ä¿±ê£º' + url + '£¨²âÊÔÖ»Ó¦·ÃÎÊ ImgBed£©');
+    throw new Error('éé¢„æœŸçš„ fetch ç›®æ ‡ï¼š' + url + 'ï¼ˆæµ‹è¯•åªåº”è®¿é—® ImgBedï¼‰');
   }
   if (u.pathname === '/upload' && (init.method || 'GET') === 'POST') {
     const bytes = await streamToText(init.body);
@@ -98,13 +102,14 @@ const env = {
   FILE_SECRET: 'filesec',
   APP_NAME: 'T',
   APP_SUBTITLE: 'S',
-  IMG_BED_ADMIN_TOKEN: 'imgbed-admin', // ÈÃ deleteFromImgBed ÕæÕı´¥·¢ÇåÀí
+  IMG_BED_ADMIN_TOKEN: 'imgbed-admin', // è®© deleteFromImgBed çœŸæ­£è§¦å‘æ¸…ç†
 };
+const defaultAdminToken = await hmac('change-me-please', 'fcb-admin');
 
-// ---- ²âÊÔ¹¤¾ß ----
+// ---- æµ‹è¯•å·¥å…· ----
 let pass = 0, fail = 0;
 function ok(cond, msg) { if (cond) { pass++; } else { fail++; console.error('   ? ' + msg); } }
-function eq(a, b, msg) { ok(a === b, `${msg} (ÆÚÍû ${JSON.stringify(b)}, Êµ¼Ê ${JSON.stringify(a)})`); }
+function eq(a, b, msg) { ok(a === b, `${msg} (æœŸæœ› ${JSON.stringify(b)}, å®é™… ${JSON.stringify(a)})`); }
 
 async function call(method, path, body, headers = {}) {
   const init = { method, headers };
@@ -118,151 +123,179 @@ function fd(obj) {
   return f;
 }
 
-// ---- 1. ½¡¿µ¼ì²é & ÅäÖÃ ----
+// ---- 1. å¥åº·æ£€æŸ¥ & é…ç½® ----
 {
   const r = await call('GET', '/api/health');
   eq(r.status, 200, 'health 200');
   const c = await (await call('GET', '/api/config')).json();
-  eq(c.status ?? c.storage, 'CloudFlare-ImgBed (API)', 'config ÉùÃ÷Ê¹ÓÃ ImgBed (API)');
+  eq(c.status ?? c.storage, 'CloudFlare-ImgBed (API)', 'config å£°æ˜ä½¿ç”¨ ImgBed (API)');
 }
 
-// ---- 2. ÎÄ±¾·ÖÏí£º´´½¨ ¡ú ÔªĞÅÏ¢ ¡ú È¡¼ş ----
+// ---- 2. æ–‡æœ¬åˆ†äº«ï¼šåˆ›å»º â†’ å…ƒä¿¡æ¯ â†’ å–ä»¶ ----
 let code;
 {
-  const r = await call('POST', '/api/share', fd({ type: 'text', text: 'hello ¿ìµİ¹ñ', expire_ms: '0', download_limit: '0' }));
-  eq(r.status, 200, '´´½¨ÎÄ±¾·ÖÏí 200');
+  const r = await call('POST', '/api/share', fd({ type: 'text', text: 'hello å¿«é€’æŸœ', expire_ms: '0', download_limit: '0' }));
+  eq(r.status, 200, 'åˆ›å»ºæ–‡æœ¬åˆ†äº« 200');
   const d = await r.json();
-  ok(/^[A-Z0-9]{8}$/.test(d.code), 'È¡¼şÂë¸ñÊ½ AAAAAAAA: ' + d.code);
+  ok(/^[A-Z0-9]{8}$/.test(d.code), 'å–ä»¶ç æ ¼å¼ AAAAAAAA: ' + d.code);
   code = d.code;
 
   const meta = await (await call('GET', '/api/share/' + code)).json();
-  eq(meta.type, 'text', 'ÔªĞÅÏ¢ type=text');
-  eq(meta.has_password, false, 'ÎŞÃÜÂë±ê¼Ç');
+  eq(meta.type, 'text', 'å…ƒä¿¡æ¯ type=text');
+  eq(meta.has_password, false, 'æ— å¯†ç æ ‡è®°');
 
   const claim = await (await call('POST', '/api/share/' + code + '/claim')).json();
-  eq(claim.type, 'text', 'È¡¼ş·µ»ØÎÄ±¾');
-  eq(claim.text, 'hello ¿ìµİ¹ñ', 'ÎÄ±¾ÄÚÈİÒ»ÖÂ');
+  eq(claim.type, 'text', 'å–ä»¶è¿”å›æ–‡æœ¬');
+  eq(claim.text, 'hello å¿«é€’æŸœ', 'æ–‡æœ¬å†…å®¹ä¸€è‡´');
 }
 
-// ---- 3. ÎÄ±¾·ÖÏí + ÃÜÂë ----
+// ---- 3. æ–‡æœ¬åˆ†äº« + å¯†ç  ----
 {
   const r = await call('POST', '/api/share', fd({ type: 'text', text: 'secret', password: 'pw', download_limit: '0' }));
   const c = await r.json();
   const m = await (await call('GET', '/api/share/' + c.code)).json();
-  eq(m.has_password, true, 'ÓĞÃÜÂë±ê¼Ç');
+  eq(m.has_password, true, 'æœ‰å¯†ç æ ‡è®°');
   const noPwd = await call('POST', '/api/share/' + c.code + '/claim');
-  eq(noPwd.status, 401, 'ÎŞÃÜÂëÈ¡¼ş 401');
+  eq(noPwd.status, 401, 'æ— å¯†ç å–ä»¶ 401');
   const withPwd = await (await call('POST', '/api/share/' + c.code + '/claim', fd({ password: 'pw' }))).json();
-  eq(withPwd.text, 'secret', 'ÃÜÂëÕıÈ·È¡µ½ÎÄ±¾');
+  eq(withPwd.text, 'secret', 'å¯†ç æ­£ç¡®å–åˆ°æ–‡æœ¬');
 }
 
-// ---- 4. ÎÄ¼ş·ÖÏí£¨Î¯ÍĞ ImgBed£©£ºÉÏ´« ¡ú ´´½¨ ¡ú È¡¼ş ¡ú 302 Ìø ImgBed ----
+// ---- 4. æ–‡ä»¶åˆ†äº«ï¼ˆå§”æ‰˜ ImgBedï¼‰ï¼šä¸Šä¼  â†’ åˆ›å»º â†’ å–ä»¶ â†’ 302 è·³ ImgBed ----
 let fileCode, fileKey;
 {
-  // 4a. ÏÈ°ÑÎÄ¼şÍ¨¹ı /api/imgbed/upload Á÷Ê½´úÀíµ½ ImgBed
+  // 4a. å…ˆæŠŠæ–‡ä»¶é€šè¿‡ /api/imgbed/upload æµå¼ä»£ç†åˆ° ImgBed
   const file = new File(['hello imgbed content'], 'note.txt', { type: 'text/plain' });
   const up = await (await call('POST', '/api/imgbed/upload', fd({ file }))).json();
-  ok(up.id, 'ImgBed ·µ»ØÎÄ¼ş id');
-  ok(up.src && up.src.includes('/file/'), 'ImgBed ·µ»Ø¿É·ÃÎÊ src');
-  ok(uploaded[up.id], 'ImgBed ²àÒÑÊÕµ½²¢´æ´¢ÎÄ¼ş£¨bytes ·Ç¿Õ£©');
-  eq(uploaded[up.id].bytes, 'hello imgbed content', 'ImgBed ´æ´¢ÄÚÈİÒ»ÖÂ');
+  ok(up.id, 'ImgBed è¿”å›æ–‡ä»¶ id');
+  ok(up.src && up.src.includes('/file/'), 'ImgBed è¿”å›å¯è®¿é—® src');
+  ok(up.upload_token, 'ä¸Šä¼ æ¥å£è¿”å› upload_token');
+  ok(uploaded[up.id], 'ImgBed ä¾§å·²æ”¶åˆ°å¹¶å­˜å‚¨æ–‡ä»¶ï¼ˆbytes éç©ºï¼‰');
+  eq(uploaded[up.id].bytes, 'hello imgbed content', 'ImgBed å­˜å‚¨å†…å®¹ä¸€è‡´');
 
-  // 4b. ÓÃ file_key ´´½¨·ÖÏí£¨ÎÄ¼ş±¾Ìå²»¾­¹ı /api/share£©
-  const r = await call('POST', '/api/share', fd({
+  // 4a2. ç¼º upload_token / éæ³• file_key å¿…é¡»è¢«æ‹’ç»
+  const noUploadToken = await call('POST', '/api/share', fd({
     type: 'file', file_key: up.id, file_name: 'note.txt',
     file_type: 'text/plain', file_size: '19', expire_ms: '0', download_limit: '0',
   }));
-  eq(r.status, 200, 'ÓÃ file_key ´´½¨ÎÄ¼ş·ÖÏí 200');
+  eq(noUploadToken.status, 401, 'ç¼ºå°‘ upload_token è¢«æ‹’ç»');
+
+  const badKey = await call('POST', '/api/share', fd({
+    type: 'file', file_key: 'x"><img src=x onerror=alert(1)>', file_name: 'x',
+    file_type: 'text/plain', file_size: '1', expire_ms: '0', download_limit: '0',
+  }));
+  eq(badKey.status, 400, 'éæ³• file_key è¢«æ‹’ç»');
+
+  // 4b. ç”¨ file_key + upload_token åˆ›å»ºåˆ†äº«ï¼ˆæ–‡ä»¶æœ¬ä½“ä¸ç»è¿‡ /api/shareï¼‰
+  const r = await call('POST', '/api/share', fd({
+    type: 'file', file_key: up.id, upload_token: up.upload_token, file_name: 'note.txt',
+    file_type: 'text/plain', file_size: '19', expire_ms: '0', download_limit: '0',
+  }));
+  eq(r.status, 200, 'ç”¨ file_key åˆ›å»ºæ–‡ä»¶åˆ†äº« 200');
   const d = await r.json();
   fileCode = d.code;
 
   const meta = await (await call('GET', '/api/share/' + fileCode)).json();
-  eq(meta.type, 'file', 'ÔªĞÅÏ¢ type=file');
-  eq(meta.file_name, 'note.txt', 'ÎÄ¼şÃûÒ»ÖÂ');
-  eq(meta.file_size, 19, 'ÎÄ¼ş´óĞ¡ 19');
+  eq(meta.type, 'file', 'å…ƒä¿¡æ¯ type=file');
+  eq(meta.file_name, 'note.txt', 'æ–‡ä»¶åä¸€è‡´');
+  eq(meta.file_size, 19, 'æ–‡ä»¶å¤§å° 19');
 
   const claim = await (await call('POST', '/api/share/' + fileCode + '/claim')).json();
-  ok(claim.url.startsWith('/file/'), 'È¡¼ş·µ»Ø /file Ö±Á´');
-  ok(claim.url.includes('?t='), 'Ö±Á´´ø·ÀÖ±Á´ token');
+  ok(claim.url.startsWith('/file/'), 'å–ä»¶è¿”å› /file ç›´é“¾');
+  ok(claim.url.includes('t='), 'ç›´é“¾å¸¦çŸ­æ—¶ token');
+  ok(claim.url.includes('c=' + fileCode), 'ç›´é“¾ç»‘å®š share code');
 
   fileKey = new URL(claim.url, 'https://x.com').pathname.split('/file/')[1].split('?')[0];
-  ok(fileKey, '´Ó claim.url ½âÎö³ö file_key');
+  ok(fileKey, 'ä» claim.url è§£æå‡º file_key');
 
-  // 4c. È± token ·ÃÎÊ ¡ú 403
+  // 4c. ç¼º token è®¿é—® â†’ 403
   const noT = await call('GET', '/file/' + fileKey);
-  eq(noT.status, 403, 'È± token ·ÃÎÊ 403');
+  eq(noT.status, 403, 'ç¼º token è®¿é—® 403');
 
-  // 4d. ´ø token ·ÃÎÊ ¡ú 302 Ìø×ªµ½ ImgBed Ô­µØÖ·
+  // 4c2. è¿‡æœŸ token â†’ 403
+  const expiredToken = await fileToken(env, fileKey, fileCode, -1000);
+  const expiredRes = await call('GET', '/file/' + encodeURIComponent(fileKey) + '?c=' + fileCode + '&t=' + expiredToken);
+  eq(expiredRes.status, 403, 'è¿‡æœŸ token 403');
+
+  // 4d. å¸¦ token è®¿é—® â†’ 302 è·³è½¬åˆ° ImgBed åŸåœ°å€
   const fr = await call('GET', claim.url);
-  eq(fr.status, 302, '´ø token ·ÃÎÊ 302 Ìø×ª');
-  eq(fr.headers.get('Location'), IMG_BED_URL + '/file/' + fileKey, 'Ìø×ªÄ¿±ê¼´ ImgBed Ô­µØÖ·');
+  eq(fr.status, 302, 'å¸¦ token è®¿é—® 302 è·³è½¬');
+  eq(fr.headers.get('Location'), IMG_BED_URL + '/file/' + fileKey, 'è·³è½¬ç›®æ ‡å³ ImgBed åŸåœ°å€');
 
-  // 4e. ¸úËæÌø×ª£ºÄ£Äâä¯ÀÀÆ÷ÇëÇó ImgBed ¡ú ÄÃµ½ÕæÊµÄÚÈİ£¨ÑéÖ¤Î¯ÍĞ¿ÉÈ¡»Ø£©
+  // 4e. è·Ÿéšè·³è½¬ï¼šæ¨¡æ‹Ÿæµè§ˆå™¨è¯·æ±‚ ImgBed â†’ æ‹¿åˆ°çœŸå®å†…å®¹ï¼ˆéªŒè¯å§”æ‰˜å¯å–å›ï¼‰
   const real = await mockFetch(IMG_BED_URL + '/file/' + fileKey, { method: 'GET' });
-  eq(real.status, 200, 'ImgBed ·µ»ØÎÄ¼ş 200');
-  eq(await real.text(), 'hello imgbed content', '¸úËæÌø×ªÈ¡»ØÄÚÈİÒ»ÖÂ');
+  eq(real.status, 200, 'ImgBed è¿”å›æ–‡ä»¶ 200');
+  eq(await real.text(), 'hello imgbed content', 'è·Ÿéšè·³è½¬å–å›å†…å®¹ä¸€è‡´');
 }
 
-// ---- 5. È¡¼ş´ÎÊıÉÏÏŞ ----
+// ---- 5. å–ä»¶æ¬¡æ•°ä¸Šé™ ----
 {
   const r = await call('POST', '/api/share', fd({ type: 'text', text: 'once', download_limit: '1' }));
   const c = await r.json();
   const a = await (await call('POST', '/api/share/' + c.code + '/claim')).json();
-  eq(a.text, 'once', 'Ê×´ÎÈ¡¼ş³É¹¦');
+  eq(a.text, 'once', 'é¦–æ¬¡å–ä»¶æˆåŠŸ');
   const b = await call('POST', '/api/share/' + c.code + '/claim');
-  eq(b.status, 410, '´ÎÊıÓÃ¾¡ 410');
+  eq(b.status, 410, 'æ¬¡æ•°ç”¨å°½ 410');
 }
 
-// ---- 6. ¹ÜÀíÔ± ----
+// ---- 6. ç®¡ç†å‘˜ ----
 let adminToken;
 {
   const wrong = await call('POST', '/api/admin/login', { password: 'bad' });
-  eq(wrong.status, 401, '´íÎóÃÜÂë 401');
+  eq(wrong.status, 401, 'é”™è¯¯å¯†ç  401');
   const ok1 = await (await call('POST', '/api/admin/login', { password: 'secret123' })).json();
-  ok(ok1.token, 'µÇÂ¼·µ»Ø token');
+  ok(ok1.token, 'ç™»å½•è¿”å› token');
   adminToken = ok1.token;
 
   const noAuth = await call('GET', '/api/admin/shares');
-  eq(noAuth.status, 401, 'ÎŞ token ·ÃÎÊ 401');
+  eq(noAuth.status, 401, 'æ—  token è®¿é—® 401');
+
+  const defaultTokenRes = await call('GET', '/api/admin/stats', undefined, {
+    Authorization: 'Bearer ' + defaultAdminToken,
+  });
+  eq(defaultTokenRes.status, 401, 'å…¬å¼€é»˜è®¤å¯†é’¥ token ä¸å†å¯ç”¨');
 
   const list = await (await call('GET', '/api/admin/shares', undefined, { Authorization: 'Bearer ' + adminToken })).json();
-  ok(Array.isArray(list.shares) && list.shares.length >= 3, '·ÖÏíÁĞ±í·Ç¿Õ: ' + list.shares.length);
+  ok(Array.isArray(list.shares) && list.shares.length >= 3, 'åˆ†äº«åˆ—è¡¨éç©º: ' + list.shares.length);
   const stats = await (await call('GET', '/api/admin/stats', undefined, { Authorization: 'Bearer ' + adminToken })).json();
-  ok(stats.total >= 3, 'Í³¼Æ total>=3: ' + stats.total);
+  ok(stats.total >= 3, 'ç»Ÿè®¡ total>=3: ' + stats.total);
 }
 
-// ---- 7. É¾³ı·ÖÏí£¨Í¬²½ÇåÀí ImgBed ²à¶ÔÏó£© ----
+// ---- 7. åˆ é™¤åˆ†äº«ï¼ˆåŒæ­¥æ¸…ç† ImgBed ä¾§å¯¹è±¡ï¼‰ ----
 {
-  // ÏÈÉÏ´«Ò»¸ö×¨ÊôÎÄ¼şÓÃÓÚÉ¾³ı²âÊÔ
+  // å…ˆä¸Šä¼ ä¸€ä¸ªä¸“å±æ–‡ä»¶ç”¨äºåˆ é™¤æµ‹è¯•
   const up = await (await call('POST', '/api/imgbed/upload', fd({ file: new File(['to-delete'], 'd.txt', { type: 'text/plain' }) }))).json();
-  const r = await call('POST', '/api/share', fd({ type: 'file', file_key: up.id, file_name: 'd.txt', file_type: 'text/plain', file_size: '9', expire_ms: '0', download_limit: '0' }));
+  const r = await call('POST', '/api/share', fd({ type: 'file', file_key: up.id, upload_token: up.upload_token, file_name: 'd.txt', file_type: 'text/plain', file_size: '9', expire_ms: '0', download_limit: '0' }));
   const code = (await r.json()).code;
+  const claim = await (await call('POST', '/api/share/' + code + '/claim')).json();
 
   const del = await call('DELETE', '/api/admin/share/' + code, undefined, { Authorization: 'Bearer ' + adminToken });
-  eq(del.status, 200, 'É¾³ı 200');
+  eq(del.status, 200, 'åˆ é™¤ 200');
   const meta = await call('GET', '/api/share/' + code);
-  eq(meta.status, 404, 'É¾³ıºóÔªĞÅÏ¢ 404');
-  ok(!uploaded[up.id], 'ImgBed ²à¶ÔÏóÒÑÇåÀí');
-  ok(deletedIds.includes(up.id), 'deleteFromImgBed ÃüÖĞ ImgBed É¾³ı½Ó¿Ú');
+  eq(meta.status, 404, 'åˆ é™¤åå…ƒä¿¡æ¯ 404');
+  const afterDelete = await call('GET', claim.url);
+  eq(afterDelete.status, 404, 'åˆ é™¤åæ–‡ä»¶ç›´é“¾å¤±æ•ˆ');
+  ok(!uploaded[up.id], 'ImgBed ä¾§å¯¹è±¡å·²æ¸…ç†');
+  ok(deletedIds.includes(up.id), 'deleteFromImgBed å‘½ä¸­ ImgBed åˆ é™¤æ¥å£');
 }
 
-// ---- 8. ¹ıÆÚÇåÀí£¨sweep Ó¦Í¬²½ÇåÀí ImgBed£© ----
+// ---- 8. è¿‡æœŸæ¸…ç†ï¼ˆsweep åº”åŒæ­¥æ¸…ç† ImgBedï¼‰ ----
 {
   const up = await (await call('POST', '/api/imgbed/upload', fd({ file: new File(['expired'], 'e.txt', { type: 'text/plain' }) }))).json();
-  // È¡¼şÂëÒÑ¹ıÆÚ£¨expire_ms=1£¬Á¢¿Ì¹ıÆÚ£©¡£×¢Òâ£ºDate.now() ÎªÕûÊıºÁÃë£¬¹ÜµÀ´¦Àí±¾Éí¿ÉÄÜ < 1ms£¬
-  // µ¼ÖÂ sweep È¡µ½µÄ now ÈÔ <= expire_at(=created_at+1) ¶øÂ©ÅĞ¡ª¡ªÊôÇ½ÖÓÊ±Ğò¶¶¶¯£¬·ÇÂß¼­È±Ïİ¡£
-  // ÕâÀï°Ñ¸Ã·ÖÏíµÄ expire_at Ö±½Ó²¦µ½È·¶¨ÒÑ¹ıÈ¥µÄÊ±¼ä£¬È·±£ sweep ±Ø¶¨ÃüÖĞ£¨Éú²ú»·¾³¹ıÆÚ·ÖÏíµÄ expire_at ¼´´¦ÓÚ¹ıÈ¥£©¡£
-  const createR = await call('POST', '/api/share', fd({ type: 'file', file_key: up.id, file_name: 'e.txt', file_type: 'text/plain', file_size: '7', expire_ms: '1', download_limit: '0' }));
+  // å–ä»¶ç å·²è¿‡æœŸï¼ˆexpire_ms=1ï¼Œç«‹åˆ»è¿‡æœŸï¼‰ã€‚æ³¨æ„ï¼šDate.now() ä¸ºæ•´æ•°æ¯«ç§’ï¼Œç®¡é“å¤„ç†æœ¬èº«å¯èƒ½ < 1msï¼Œ
+  // å¯¼è‡´ sweep å–åˆ°çš„ now ä» <= expire_at(=created_at+1) è€Œæ¼åˆ¤â€”â€”å±å¢™é’Ÿæ—¶åºæŠ–åŠ¨ï¼Œéé€»è¾‘ç¼ºé™·ã€‚
+  // è¿™é‡ŒæŠŠè¯¥åˆ†äº«çš„ expire_at ç›´æ¥æ‹¨åˆ°ç¡®å®šå·²è¿‡å»çš„æ—¶é—´ï¼Œç¡®ä¿ sweep å¿…å®šå‘½ä¸­ï¼ˆç”Ÿäº§ç¯å¢ƒè¿‡æœŸåˆ†äº«çš„ expire_at å³å¤„äºè¿‡å»ï¼‰ã€‚
+  const createR = await call('POST', '/api/share', fd({ type: 'file', file_key: up.id, upload_token: up.upload_token, file_name: 'e.txt', file_type: 'text/plain', file_size: '7', expire_ms: '1', download_limit: '0' }));
   const createJ = await createR.json();
   await fcb_db.prepare('UPDATE shares SET expire_at = ? WHERE code = ?').bind(Date.now() - 60_000, createJ.code).run();
 
   const sweep = await (await call('POST', '/api/admin/sweep', undefined, { Authorization: 'Bearer ' + adminToken })).json();
-  ok(sweep.cleaned >= 1, 'sweep ÇåÀíÁËÖÁÉÙ 1 Ìõ: ' + sweep.cleaned);
-  ok(sweep.cleaned >= 1, 'sweep ÇåÀíÁËÖÁÉÙ 1 Ìõ: ' + sweep.cleaned);
-  ok(deletedIds.includes(up.id) || !uploaded[up.id], 'sweep Í¬²½ÇåÀíÁË ImgBed ²àµÄ¹ıÆÚ¶ÔÏó');
+  ok(sweep.cleaned >= 1, 'sweep æ¸…ç†äº†è‡³å°‘ 1 æ¡: ' + sweep.cleaned);
+  ok(sweep.cleaned >= 1, 'sweep æ¸…ç†äº†è‡³å°‘ 1 æ¡: ' + sweep.cleaned);
+  ok(deletedIds.includes(up.id) || !uploaded[up.id], 'sweep åŒæ­¥æ¸…ç†äº† ImgBed ä¾§çš„è¿‡æœŸå¯¹è±¡');
 
-  // Ë³´øÑéÖ¤ cron scheduled Â·¾¶²»»áÅ×´í£¨Ö±½Óµ÷ÓÃ storage Èë¿ÚÒÑÔÚÉÏÃæ¸²¸Ç£©
+  // é¡ºå¸¦éªŒè¯ cron scheduled è·¯å¾„ä¸ä¼šæŠ›é”™ï¼ˆç›´æ¥è°ƒç”¨ storage å…¥å£å·²åœ¨ä¸Šé¢è¦†ç›–ï¼‰
 }
 
-console.log(`\n½á¹û£ºÍ¨¹ı ${pass}£¬Ê§°Ü ${fail}`);
+console.log(`\nç»“æœï¼šé€šè¿‡ ${pass}ï¼Œå¤±è´¥ ${fail}`);
 process.exit(fail ? 1 : 0);

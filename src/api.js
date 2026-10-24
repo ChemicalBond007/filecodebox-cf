@@ -3,10 +3,14 @@ import * as db from './db.js';
 import * as storage from './storage.js';
 import {
   genCode,
-  sha256,
+  hashPassword,
+  verifyPassword,
+  constantTimeEqual,
   verifyAdmin,
   expectedAdminToken,
   fileToken,
+  verifyUploadToken,
+  isValidFileKey,
 } from './auth.js';
 import { EXPIRE_PRESETS, DOWNLOAD_PRESETS, appName, appSubtitle } from './config.js';
 
@@ -23,10 +27,10 @@ function clientIp(request) {
 }
 
 // 过期判定：永久 = expire_at 为 null 或 0
-function isExpired(row, now = Date.now()) {
+export function isExpired(row, now = Date.now()) {
   return row.expire_at && row.expire_at !== 0 && row.expire_at <= now;
 }
-function isDepleted(row) {
+export function isDepleted(row) {
   return row.download_limit > 0 && row.downloads >= row.download_limit;
 }
 
@@ -45,18 +49,16 @@ export async function createShare({ request, env }) {
         return form;
       },
     };
-    form._isJson = true;
   } else {
     form = await request.formData();
   }
 
   const type = form.get('type');
   const text = form.get('text');
-  const file = form.get('file');
   const password = form.get('password');
 
-  let shareType = type;
-  if (!shareType) shareType = file ? 'file' : 'text';
+  let shareType = type ? String(type) : '';
+  if (!shareType) shareType = form.get('file') ? 'file' : 'text';
   if (shareType !== 'text' && shareType !== 'file') {
     return json({ error: 'type 必须是 text 或 file' }, 400);
   }
@@ -72,33 +74,45 @@ export async function createShare({ request, env }) {
   };
 
   if (shareType === 'text') {
-    if (!text || !text.trim()) return json({ error: '文本内容不能为空' }, 400);
+    if (typeof text !== 'string' || !text.trim()) return json({ error: '文本内容不能为空' }, 400);
     if (text.length > 222 * 1024) return json({ error: '文本过长（上限 222KB）' }, 413);
     row.text_content = text;
   } else {
-    // 文件模式：file_key 由 /api/imgbed/upload 代理上传到 ImgBed 后返回，
-    // 这里只接收并记录（file 本体不经过本接口，避免请求体大小限制）
-    const fileKey = form.get('file_key');
-    if (!fileKey) {
+    // 文件模式：file_key 由上传接口返回；upload_token 证明该 key 确实由本 Worker 产生，
+    // 防止客户端随便引用他人文件（也防止删除时误删 ImgBed 上的任意对象）。
+    const rawKey = form.get('file_key');
+    if (!rawKey) {
       return json({ error: '请先通过 /api/imgbed/upload 上传文件，再提交 file_key' }, 400);
     }
-    row.file_key = String(fileKey);
-    row.file_name = form.get('file_name') || 'file';
-    row.file_type = form.get('file_type') || 'application/octet-stream';
-    row.file_size = parseInt(form.get('file_size') || '0', 10) || 0;
+    const fileKey = String(rawKey);
+    if (!isValidFileKey(fileKey)) {
+      return json({ error: '文件标识格式无效' }, 400);
+    }
+    const uploadTokenValue = form.get('upload_token');
+    if (!uploadTokenValue || !(await verifyUploadToken(env, fileKey, String(uploadTokenValue)))) {
+      return json({ error: '上传凭证无效或已过期，请重新上传文件' }, 401);
+    }
+
+    row.file_key = fileKey;
+    row.file_name = String(form.get('file_name') || 'file').slice(0, 255);
+    row.file_type = String(form.get('file_type') || 'application/octet-stream').slice(0, 255);
+    const size = parseInt(String(form.get('file_size') ?? '0'), 10);
+    row.file_size = Number.isFinite(size) && size >= 0 ? size : 0;
   }
 
   // 过期时间（毫秒，0/缺省=永久）
-  const expireMs = parseInt(form.get('expire_ms') || '0', 10);
-  if (expireMs > 0) row.expire_at = row.created_at + expireMs;
+  const expireMs = parseInt(String(form.get('expire_ms') ?? '0'), 10);
+  if (Number.isFinite(expireMs) && expireMs > 0) row.expire_at = row.created_at + expireMs;
 
   // 下载次数上限
-  const dl = parseInt(form.get('download_limit') || '0', 10);
+  const dl = parseInt(String(form.get('download_limit') ?? '0'), 10);
   row.download_limit = Number.isFinite(dl) && dl > 0 ? dl : 0;
 
   // 访问密码
-  if (password && String(password).length) {
-    row.password = await sha256(String(password));
+  if (password != null && String(password).length) {
+    const plain = String(password);
+    if (plain.length > 1024) return json({ error: '密码过长' }, 413);
+    row.password = await hashPassword(plain);
   }
 
   await db.createShare(env.fcb_db, row);
@@ -134,7 +148,7 @@ export async function getShareMeta({ params, env }) {
   return json(base);
 }
 
-// POST /api/share/:code/claim  —— 取件（消耗一次）
+// POST /api/share/:code/claim  —— 取件（原子消耗一次）
 export async function claimShare({ request, params, env }) {
   const row = await db.getShare(env.fcb_db, params.code);
   if (!row) return json({ error: '取件码不存在' }, 404);
@@ -152,24 +166,31 @@ export async function claimShare({ request, params, env }) {
       const f = await request.formData().catch(() => null);
       provided = f ? f.get('password') || '' : '';
     }
-    const ok = (await sha256(String(provided))) === row.password;
+    const ok = await verifyPassword(String(provided), row.password);
     if (!ok) return json({ error: '密码错误', requiresPassword: true }, 401);
   }
 
-  await db.incrementDownloads(env.fcb_db, params.code);
+  if (row.type === 'file' && !isValidFileKey(row.file_key)) {
+    return json({ error: '文件记录无效' }, 500);
+  }
+
+  // 条件 UPDATE：并发取件时最多只有一个请求能成功扣减，避免超发。
+  const consumed = await db.consumeDownload(env.fcb_db, params.code);
+  if (!consumed) return json({ error: '该分享已达取件上限或已过期' }, 410);
 
   if (row.type === 'text') {
     return json({ type: 'text', text: row.text_content });
   }
 
-  // 文件：签发轻量防直链 token，返回可直接访问的 URL
-  const token = await fileToken(env, row.file_key);
+  // 文件：签发短时防直链 token（绑定 share code + file key），返回可直接访问的 URL。
+  const token = await fileToken(env, row.file_key, params.code);
+  const query = new URLSearchParams({ c: params.code, t: token });
   return json({
     type: 'file',
     file_name: row.file_name,
     file_type: row.file_type,
     file_size: row.file_size,
-    url: `/file/${row.file_key}?t=${token}`,
+    url: `/file/${encodeURIComponent(row.file_key)}?${query.toString()}`,
   });
 }
 
@@ -185,15 +206,20 @@ export async function adminLogin({ request, env }) {
     const f = await request.formData().catch(() => null);
     password = f ? f.get('password') || '' : '';
   }
+  const input = String(password);
+
   // 若配置了静态 ADMIN_API_TOKEN，则它本身就是可直接使用的 Bearer token：
   // 在登录框填入该 token 也会直接返回它，前端拿到后即可用 Bearer 调用管理接口。
-  if (env.ADMIN_API_TOKEN && String(password) === String(env.ADMIN_API_TOKEN)) {
+  if (env.ADMIN_API_TOKEN && constantTimeEqual(input, String(env.ADMIN_API_TOKEN))) {
     return json({ token: env.ADMIN_API_TOKEN });
   }
-  if (!env.ADMIN_KEY || String(password) !== String(env.ADMIN_KEY)) {
+
+  // 未配置 ADMIN_KEY 时，不再回退到任何默认密钥。
+  if (!env.ADMIN_KEY || !constantTimeEqual(input, String(env.ADMIN_KEY))) {
     return json({ error: '管理员密码错误' }, 401);
   }
   const token = await expectedAdminToken(env);
+  if (!token) return json({ error: '管理员未配置' }, 401);
   return json({ token });
 }
 
@@ -207,6 +233,7 @@ async function requireAdmin(env, request) {
 export async function adminStats(ctx) {
   const denied = await requireAdmin(ctx.env, ctx.request);
   if (denied) return denied;
+  await db.ensureSchema(ctx.env.fcb_db);
   const total = await db.countShares(ctx.env.fcb_db);
   const active = await db.countActive(ctx.env.fcb_db);
   const now = Date.now();
@@ -231,7 +258,11 @@ export async function adminDelete(ctx) {
   const row = await db.getShare(ctx.env.fcb_db, code);
   if (!row) return json({ error: '不存在' }, 404);
   await db.deleteShare(ctx.env.fcb_db, code);
-  await storage.deleteFromImgBed(ctx.env, row.file_key);
+  if (row.type === 'file' && row.file_key) {
+    // 同一对象可能被多个取件码引用，只有最后一个引用删除后才清理存储。
+    const remaining = await db.countSharesByFileKey(ctx.env.fcb_db, row.file_key);
+    if (remaining === 0) await storage.deleteFromImgBed(ctx.env, row.file_key);
+  }
   return json({ ok: true });
 }
 
@@ -239,7 +270,10 @@ export async function adminSweep(ctx) {
   const denied = await requireAdmin(ctx.env, ctx.request);
   if (denied) return denied;
   const keys = await db.sweepExpired(ctx.env.fcb_db, Date.now());
-  for (const k of keys) await storage.deleteFromImgBed(ctx.env, k);
+  for (const k of [...new Set(keys)]) {
+    const remaining = await db.countSharesByFileKey(ctx.env.fcb_db, k);
+    if (remaining === 0) await storage.deleteFromImgBed(ctx.env, k);
+  }
   return json({ cleaned: keys.length });
 }
 

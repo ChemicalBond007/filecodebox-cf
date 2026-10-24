@@ -81,13 +81,21 @@ export async function getShare(db, code) {
   return row || null;
 }
 
-// 取件时 +1 下载计数
-export async function incrementDownloads(db, code) {
+// 取件时原子消耗一次：条件 UPDATE 保证并发请求不会超过 download_limit。
+export async function consumeDownload(db, code, now = Date.now()) {
   await ensureSchema(db);
-  await db
-    .prepare(`UPDATE shares SET downloads = downloads + 1 WHERE code = ?`)
-    .bind(code)
+  const result = await db
+    .prepare(
+      `UPDATE shares SET downloads = downloads + 1
+       WHERE code = ?
+         AND (expire_at IS NULL OR expire_at = 0 OR expire_at > ?)
+         AND (download_limit = 0 OR downloads < download_limit)`
+    )
+    .bind(code, now)
     .run();
+  const changes = Number(result && result.meta ? result.meta.changes : NaN);
+  // 本地 mock 未提供 meta.changes 时按成功处理；生产 D1 一定返回 changes。
+  return Number.isFinite(changes) ? changes > 0 : true;
 }
 
 export async function deleteShare(db, code) {
@@ -120,7 +128,8 @@ export async function countActive(db) {
   const r = await db
     .prepare(
       `SELECT COUNT(*) AS c FROM shares
-       WHERE (expire_at IS NULL OR expire_at = 0 OR expire_at > ?)`
+       WHERE (expire_at IS NULL OR expire_at = 0 OR expire_at > ?)
+         AND (download_limit = 0 OR downloads < download_limit)`
     )
     .bind(now)
     .first();
@@ -128,8 +137,19 @@ export async function countActive(db) {
 }
 
 // 清理过期 / 超额分享：返回被删除的 file_key 列表，供调用方清理 R2
+export async function countSharesByFileKey(db, key) {
+  if (!key) return 0;
+  await ensureSchema(db);
+  const r = await db
+    .prepare(`SELECT COUNT(*) AS c FROM shares WHERE file_key = ?`)
+    .bind(key)
+    .first();
+  return r ? r.c : 0;
+}
+
 export async function getShareByFileKey(db, key) {
   if (!key) return null;
+  await ensureSchema(db);
   const row = await db
     .prepare(`SELECT code, file_name, file_type, file_size FROM shares WHERE file_key = ?`)
     .bind(key)
@@ -139,22 +159,34 @@ export async function getShareByFileKey(db, key) {
 
 export async function sweepExpired(db, now = Date.now()) {
   await ensureSchema(db);
-  const expired = await db
-    .prepare(
-      `SELECT code, file_key FROM shares
-       WHERE (expire_at IS NOT NULL AND expire_at != 0 AND expire_at <= ?)
-          OR (download_limit > 0 AND downloads >= download_limit)`
-    )
-    .bind(now)
-    .all();
-  const rows = expired.results || [];
-  if (rows.length) {
+  const keys = [];
+  const BATCH = 100; // D1 单条 SQL 的绑定参数有上限，批量删除避免超限
+
+  for (let round = 0; round < 1000; round++) {
+    const expired = await db
+      .prepare(
+        `SELECT code, file_key FROM shares
+         WHERE (expire_at IS NOT NULL AND expire_at != 0 AND expire_at <= ?)
+            OR (download_limit > 0 AND downloads >= download_limit)
+         LIMIT ${BATCH}`
+      )
+      .bind(now)
+      .all();
+    const rows = expired.results || [];
+    if (!rows.length) break;
+
     const codes = rows.map((r) => r.code);
     const placeholders = codes.map(() => '?').join(',');
     await db
       .prepare(`DELETE FROM shares WHERE code IN (${placeholders})`)
       .bind(...codes)
       .run();
+
+    for (const r of rows) {
+      if (r.file_key) keys.push(r.file_key);
+    }
+    if (rows.length < BATCH) break;
   }
-  return rows.map((r) => r.file_key).filter(Boolean);
+
+  return keys;
 }

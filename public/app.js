@@ -135,8 +135,9 @@
         // 文件上传：Telegram 模式下大文件（>20MB）走客户端分块（init→逐片→merge），
         // 绕过 Cloudflare Worker 请求体/CPU 限制；其余走 /api/imgbed/upload（ImgBed 模式或 Telegram 小文件）。
         const up = await uploadFileKey(state.file);
-        if (!up.id) throw new Error('存储后端未返回文件 id');
+        if (!up.id || !up.upload_token) throw new Error('存储后端未返回文件凭证');
         fd.set('file_key', up.id);
+        fd.set('upload_token', up.upload_token);
         fd.set('file_name', state.file.name);
         fd.set('file_type', state.file.type || 'application/octet-stream');
         fd.set('file_size', String(state.file.size));
@@ -151,7 +152,7 @@
     }
   });
 
-  // 文件上传：返回 { id }（即分享用的 file_key）。
+  // 文件上传：返回 { id, upload_token }（id 即分享用的 file_key，upload_token 证明来源）。
   // Telegram 模式且文件 > 20MB 时走客户端分块上传（复用 ImgBed 的 init→chunk→merge 协议），
   // 否则直接 /api/imgbed/upload（ImgBed 模式流式代理，或 Telegram 小文件单发）。
   async function uploadFileKey(file) {
@@ -180,8 +181,14 @@
       fd.set('index', String(i));
       fd.set('fileName', fileName);
       const r = await api('/api/chunk/upload', { method: 'POST', body: fd });
-      if (!r.success) throw new Error(`分片 ${i + 1}/${total} 上传失败`);
-      chunks.push({ index: i, fileId: r.fileId, size: r.size, fileName: r.fileName });
+      if (!r.success || !r.chunkToken) throw new Error(`分片 ${i + 1}/${total} 上传失败`);
+      chunks.push({
+        index: i,
+        fileId: r.fileId,
+        size: r.size,
+        fileName: r.fileName,
+        chunkToken: r.chunkToken,
+      });
     }
     return await api('/api/chunk/merge', {
       method: 'POST',
@@ -246,11 +253,13 @@
           <button class="mini-btn" id="copyText" style="margin-top:12px">复制文本</button>`;
         $('#copyText').addEventListener('click', () => copy(claim.text, '已复制'));
       } else {
+        const safeName = escapeHtml(claim.file_name || 'file');
+        const safeUrl = escapeHtml(claim.url || '');
         out.innerHTML = `<div class="file-result">
           <div class="fr-icon">📄</div>
-          <div class="fr-name">${escapeHtml(claim.file_name)}</div>
+          <div class="fr-name">${safeName}</div>
           <div class="fr-size">${fmtSize(claim.file_size)}</div>
-          <a class="primary-btn" href="${claim.url}" download="${escapeHtml(claim.file_name)}">下载文件</a>
+          <a class="primary-btn" href="${safeUrl}" download="${safeName}">下载文件</a>
         </div>`;
       }
     } catch (e) {
@@ -329,12 +338,12 @@
       const list = await api('/api/admin/shares', { headers: authHeader() });
       const rows = list.shares.map((r) => `
         <tr>
-          <td class="code-cell">${formatCode(r.code)}</td>
+          <td class="code-cell">${escapeHtml(formatCode(r.code))}</td>
           <td>${r.type === 'file' ? '📄 文件' : '✏️ 文本'}</td>
           <td>${escapeHtml(r.file_name || '—')}</td>
           <td>${r.download_limit > 0 ? (r.download_limit - r.downloads) : '∞'}</td>
           <td>${fmtExpire(r.expire_at)}</td>
-          <td><button class="del" data-code="${r.code}">删除</button></td>
+          <td><button class="del" data-code="${escapeHtml(r.code)}">删除</button></td>
         </tr>`).join('') || '<tr><td colspan="6" class="muted">暂无分享</td></tr>';
       $('#shareRows').innerHTML = rows;
       $$('#shareRows .del').forEach((b) =>

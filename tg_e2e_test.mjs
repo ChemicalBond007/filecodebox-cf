@@ -19,6 +19,7 @@ async function uploadAndShare(payload, fileName, fileType) {
   const sf = new FormData();
   sf.append('type', 'file');
   sf.append('file_key', upJson.id);
+  sf.append('upload_token', upJson.upload_token);
   sf.append('file_name', fileName);
   sf.append('file_type', fileType);
   sf.append('file_size', String(payload.length));
@@ -46,8 +47,14 @@ async function clientChunkUpload(payload, fileName, fileType) {
     fd.append('index', String(i));
     fd.append('fileName', chunkFileName);
     const r = await (await fetch(`${BASE}/api/chunk/upload`, { method: 'POST', body: fd })).json();
-    if (!r.success) throw new Error('分片上传失败：' + JSON.stringify(r));
-    chunks.push({ index: i, fileId: r.fileId, size: r.size, fileName: r.fileName });
+    if (!r.success || !r.chunkToken) throw new Error('分片上传失败：' + JSON.stringify(r));
+    chunks.push({
+      index: i,
+      fileId: r.fileId,
+      size: r.size,
+      fileName: r.fileName,
+      chunkToken: r.chunkToken,
+    });
   }
   const merge = await (await fetch(`${BASE}/api/chunk/merge`, {
     method: 'POST',
@@ -58,6 +65,7 @@ async function clientChunkUpload(payload, fileName, fileType) {
   const sf = new FormData();
   sf.append('type', 'file');
   sf.append('file_key', merge.id);
+  sf.append('upload_token', merge.upload_token);
   sf.append('file_name', fileName);
   sf.append('file_type', fileType);
   sf.append('file_size', String(payload.length));
@@ -78,6 +86,9 @@ async function main() {
     assert(!upJson.id.startsWith('c:'), '小文件不应分片（file_key 不应以 c: 开头）');
     const dl = await fetch(`${BASE}${claimUrl}`);
     assert(dl.status === 200, '小文件下载 200');
+    assert(dl.headers.get('content-type') === 'application/octet-stream', '文件响应 Content-Type 固定为 octet-stream');
+    assert((dl.headers.get('content-disposition') || '').startsWith('attachment'), '文件响应强制 attachment');
+    assert(dl.headers.get('x-content-type-options') === 'nosniff', '文件响应带 nosniff');
     const got = new Uint8Array(await dl.arrayBuffer());
     assert(got.length === payload.length, `小文件字节数 ${got.length} != ${payload.length}`);
     for (let i = 0; i < payload.length; i++) assert(got[i] === payload[i], '小文件字节不一致 @' + i);

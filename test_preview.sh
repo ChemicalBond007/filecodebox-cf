@@ -32,15 +32,16 @@ ok "$(curl -s -X POST -F password=pw $B/api/share/$pc/claim | grep -q secret && 
 echo "== 5. 文件分享（委托 ImgBed） =="
 up=$(curl -s -F file=@/etc/hostname $B/api/imgbed/upload)
 uid=$(echo "$up" | grep -o '"id":"[^"]*"' | cut -d'"' -f4)
-ok "$([ -n "$uid" ] && echo 0 || echo 1)" "ImgBed 返回 id: $uid"
+ut=$(echo "$up" | grep -o '"upload_token":"[^"]*"' | cut -d'"' -f4)
+ok "$([ -n "$uid" ] && [ -n "$ut" ] && echo 0 || echo 1)" "ImgBed 返回 id + upload_token: $uid"
 fsz=$(wc -c < /etc/hostname)
-fc=$(curl -s -F type=file -F file_key=$uid -F file_name=hostname -F file_type=text/plain -F file_size=$fsz -F expire_ms=0 -F download_limit=0 $B/api/share | grep -o "$CODE_RE" | cut -d'"' -f4)
+fc=$(curl -s -F type=file -F file_key=$uid -F upload_token=$ut -F file_name=hostname -F file_type=text/plain -F file_size=$fsz -F expire_ms=0 -F download_limit=0 $B/api/share | grep -o "$CODE_RE" | cut -d'"' -f4)
 ok "$([ -n "$fc" ] && echo 0 || echo 1)" "file share code: $fc"
 ok "$(curl -s $B/api/share/$fc | grep -q '"type":"file"' && echo 0 || echo 1)" "fmeta type=file"
 fclaim=$(curl -s -X POST $B/api/share/$fc/claim)
 furl=$(echo "$fclaim" | grep -o '"/file/[^"]*"' | tr -d '"')
 fkey_nq=$(echo "$furl" | sed 's/[?].*//')
-ok "$(echo "$furl" | grep -q '?t=' && echo 0 || echo 1)" "直链带 token"
+ok "$(echo "$furl" | grep -q 't=' && echo 0 || echo 1)" "直链带 token"
 ok "$([ "$(code "$B$fkey_nq")" = "403" ] && echo 0 || echo 1)" "缺 token 403"
 ok "$([ "$(code "$B$furl")" = "302" ] && echo 0 || echo 1)" "带 token 302"
 loc=$(curl -s -o /dev/null -w "%{redirect_url}" "$B$furl")
@@ -62,15 +63,19 @@ ok "$([ "$(code -H "Authorization: Bearer $at" $B/api/admin/shares)" = "200" ] &
 echo "   stats: $(curl -s -H "Authorization: Bearer $at" $B/api/admin/stats)"
 
 echo "== 8. 删除分享（同步清理 ImgBed） =="
-up2=$(curl -s -F file=@/etc/hostname $B/api/imgbed/upload | grep -o '"id":"[^"]*"' | cut -d'"' -f4)
-dc=$(curl -s -F type=file -F file_key=$up2 -F file_name=h -F file_type=text/plain -F file_size=$fsz -F expire_ms=0 $B/api/share | grep -o "$CODE_RE" | cut -d'"' -f4)
+up2j=$(curl -s -F file=@/etc/hostname $B/api/imgbed/upload)
+up2=$(echo "$up2j" | grep -o '"id":"[^"]*"' | cut -d'"' -f4)
+ut2=$(echo "$up2j" | grep -o '"upload_token":"[^"]*"' | cut -d'"' -f4)
+dc=$(curl -s -F type=file -F file_key=$up2 -F upload_token=$ut2 -F file_name=h -F file_type=text/plain -F file_size=$fsz -F expire_ms=0 $B/api/share | grep -o "$CODE_RE" | cut -d'"' -f4)
 ok "$([ "$(code -X DELETE -H "Authorization: Bearer $at" $B/api/admin/share/$dc)" = "200" ] && echo 0 || echo 1)" "删除 200"
 ok "$([ "$(code $B/api/share/$dc)" = "404" ] && echo 0 || echo 1)" "删除后 404"
 ok "$([ "$(code $B/__imgbed-file/$up2)" = "404" ] && echo 0 || echo 1)" "ImgBed 侧对象已清理"
 
 echo "== 9. Cron/sweep 路径 =="
-up3=$(curl -s -F file=@/etc/hostname $B/api/imgbed/upload | grep -o '"id":"[^"]*"' | cut -d'"' -f4)
-curl -s -F type=file -F file_key=$up3 -F file_name=h -F file_type=text/plain -F file_size=$fsz -F expire_ms=1 $B/api/share >/dev/null
+up3j=$(curl -s -F file=@/etc/hostname $B/api/imgbed/upload)
+up3=$(echo "$up3j" | grep -o '"id":"[^"]*"' | cut -d'"' -f4)
+ut3=$(echo "$up3j" | grep -o '"upload_token":"[^"]*"' | cut -d'"' -f4)
+curl -s -F type=file -F file_key=$up3 -F upload_token=$ut3 -F file_name=h -F file_type=text/plain -F file_size=$fsz -F expire_ms=1 $B/api/share >/dev/null
 sw=$(curl -s -X POST -H "Authorization: Bearer $at" $B/api/admin/sweep); echo "   sweep: $sw"
 ok "$(echo "$sw" | grep -q cleaned && echo 0 || echo 1)" "sweep 返回 cleaned"
 ok "$([ "$(code $B/__imgbed-file/$up3)" = "404" ] && echo 0 || echo 1)" "sweep 同步清理 ImgBed"

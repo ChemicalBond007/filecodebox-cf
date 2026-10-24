@@ -24,7 +24,7 @@
 │  寄件 POST /api/share ──┐                                      │
 │  取件 GET/POST /api/share/:code ─┐                             │
 │  上传 POST /api/imgbed/upload ──┐ 流式代理 ──► ImgBed /upload  │
-│  文件 GET /file/:key  ◄──── 校验 token 后：ImgBed 302 / Telegram 服务端取回字节   │
+│  文件 GET /file/:key?c=&t= ◄── 校验短时 token + 分享状态：ImgBed 302 / Telegram 取回 │
 │  管理 /api/admin/*                                               │
 └───────────────┬────────────────────────────┬───────────────────┘
                 │                            │
@@ -64,10 +64,13 @@
 - **存储后端（二选一，决定文件存到哪）：**
   - **用 ImgBed（默认）**：`IMG_BED_URL` —— 已部署的 ImgBed 实例地址，如 `https://img.example.com`。（不要同时设下面两个 TG 变量，否则会切到 Telegram）
   - **用 Telegram（免部署）**：同时设 `TG_BOT_TOKEN`（Bot Token）和 `TG_CHAT_ID`（频道/群组 ID）。配置后文件直存 Telegram，`IMG_BED_URL` 可留空。详见下方「直连 Telegram 存储」。
-- **管理凭证（二选一）：**
+- **管理凭证（至少设置一个）：**
   - `ADMIN_API_TOKEN`（**推荐**，Secret 类型）：设一个随机串。配置后管理接口直接 `Authorization: Bearer <ADMIN_API_TOKEN>` 调用，**无需登录**，类 ImgBed 的 API Token 用法。
   - `ADMIN_KEY`：管理后台**密码**（Secret 类型）。走前端登录拿 token 的旧流程。
-  - 两者都设也可；只设其中一个即可。
+  - 两者都设也可；只设其中一个即可。**注意：未配置 `ADMIN_KEY` 时不会再回退到任何默认密钥，旧式密码登录会直接拒绝。**
+- **令牌签名密钥（强烈建议）：**
+  - `FILE_SECRET`（Secret 类型）：至少 32 字节的随机串，用于文件直链、上传凭证、分片凭证的 HMAC。
+  - 未设置时回退到 `ADMIN_KEY` 或 `ADMIN_API_TOKEN`；三者都没有时，上传/文件分享会失败，**不会使用公开默认值**。
 - **可选：**
   - `TG_API`：仅 Telegram 模式用。自定义反代域名，用于 `api.telegram.org` 被墙的环境；留空则用官方 API（Cloudflare Worker 出网到 Telegram 一般通畅）。
   - `IMG_BED_UPLOAD_TOKEN`：ImgBed 的 **API Token**（形如 `imgbed_...`），通过 `Authorization: Bearer` 请求头传给 ImgBed（这是 CloudFlare-ImgBed 上传鉴权的方式，务必用此变量）。
@@ -120,9 +123,9 @@
 ### 行为
 
 - **上传**：
-  - **大文件（> 20MB）走客户端分块**：前端把文件切成 16MB 小片，逐片经 `/api/chunk/upload` 单独 `sendDocument` 到 Telegram，最后 `/api/chunk/merge` 把各片元信息（`index/fileId/size/fileName`）汇总成 `c:` 的 `file_key`。这样大文件**不必一次性推到 Worker**，从而绕过 Cloudflare 的请求体 / CPU 限制；分片上传**无理论上限**（受 1 小时会话超时与上传速度约束），与 CloudFlare-ImgBed 的客户端分块逻辑一致。
+  - **大文件（> 20MB）走客户端分块**：前端把文件切成 16MB 小片，逐片经 `/api/chunk/upload` 单独 `sendDocument` 到 Telegram，最后 `/api/chunk/merge` 校验各片 `chunkToken` 并汇总成 `c:` 的 `file_key`。这样大文件**不必一次性推到 Worker**，从而绕过 Cloudflare 的请求体 / CPU 限制；分片数有 1000 片防护上限，受 1 小时会话超时与上传速度约束。
   - **小文件（≤ 20MB）**：前端经 `/api/imgbed/upload` 单发；若整文件 > 16MB，服务端也会兜底自动分片（同上的 `c:` 格式），向后兼容旧调用方式。
-- **取件**：`/file/:key?t=TOKEN` 先校验 HMAC 防直链 token，再在服务端用 bot token 调 `getFile` 取回字节并流式返回。**bot token 始终留在服务端，不会下发给浏览器**（与 ImgBed 的 302 不同，这里不暴露任何 token，更安全）。分片文件按序串联各片返回，支持 `Range`（视频拖动）与 `HEAD`。
+- **取件**：`/file/:key?c=CODE&t=TOKEN` 先校验 10 分钟短时 token 和分享状态，再在服务端用 bot token 调 `getFile` 取回字节并流式返回。**bot token 始终留在服务端，不会下发给浏览器**（与 ImgBed 的 302 不同，这里不暴露任何 token，更安全）。分片文件按序串联各片返回，支持 `Range`（视频拖动）与 `HEAD`；响应强制 `attachment` + `application/octet-stream`。
 - **文件名**：含中文等非 ASCII 字符时按 RFC 5987 用 `filename*` 编码，浏览器能正确下载出中文名。
 - **删除**：删除分享时**不会**清理 Telegram 侧消息（文件仍保留在频道/群里），介意的话定期清理频道即可。
 
@@ -131,11 +134,11 @@
 > | 场景 | 限制 |
 > |------|------|
 > | 单文件上传 | 16MB（安全阈值）/ 20MB（Telegram Bot API 硬限，确保可整文件经 `getFile` 取回） |
-> | 分片上传 | 每片 ≤ 16MB，**无理论上限**（受 1 小时会话超时与上传速度约束） |
+> | 分片上传 | 每片 ≤ 16MB，最多 1000 片（受 1 小时会话超时与上传速度约束） |
 > | 单文件下载 | 20MB（`getFile` 限制） |
 > | 分片下载 | **无限制**（逐片 `getFile` 拼接，支持 `Range` / `HEAD`） |
 >
-> 超过 16MB 的文件自动分片，分片元信息编码进 `file_key`（无需额外存储），取件时按序流式重组。大文件（> 20MB）由前端**客户端分块上传**（`init → 逐片 /api/chunk/upload → /api/chunk/merge`，每片 16MB），逐片独立请求，不受 Cloudflare Worker 请求体 / CPU 限制，**分片数无上限**。需要超大文件或更高吞吐时，ImgBed 后端（R2）同样可用、且无此约束。
+> 超过 16MB 的文件自动分片，分片元信息编码进 `file_key`（无需额外存储），取件时按序流式重组。大文件（> 20MB）由前端**客户端分块上传**（`init → 逐片 /api/chunk/upload → /api/chunk/merge`，每片 16MB），逐片独立请求，不受 Cloudflare Worker 请求体 / CPU 限制；代码设置 1000 片防护上限。需要超大文件或更高吞吐时，ImgBed 后端（R2）同样可用、且无此约束。
 
 ### 本地调试（mock Telegram）
 
@@ -157,8 +160,8 @@ BASE=http://127.0.0.1:8088 node tg_e2e_test.mjs  # 上传→分享→取件→�
 | 取件码 | 服务端生成 | 服务端生成（形如 `A1B2-C3D4`） |
 | 过期时间 | 时/分/天 | 1h / 1d / 7d / 30d / 永久 |
 | 取件次数 | 次数上限 | 1 / 10 / 100 / 不限 |
-| 访问密码 | 部分版本 | ✅（SHA-256 存储） |
-| 防直链 | download key | HMAC 签名的 `/file/:key?t=` |
+| 访问密码 | 部分版本 | ✅（PBKDF2 存储，兼容旧 SHA-256） |
+| 防直链 | download key | 短时 HMAC 签名的 `/file/:key?c=&t=`（10 分钟） |
 | 管理后台 | ✅ | ✅ 统计 / 列表 / 删除 / 清理 |
 | 大文件 | 需客户端分片 | ✅（委托 ImgBed，**原生支持大文件 / 分片，无大小限制**） |
 
@@ -168,14 +171,14 @@ BASE=http://127.0.0.1:8088 node tg_e2e_test.mjs  # 上传→分享→取件→�
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| `POST` | `/api/share` | 创建分享。`multipart`：`type=text\|file`、`text`、`file_key`+`file_name`+`file_type`+`file_size`（文件先经 `/api/imgbed/upload` 上传）、`expire_ms`、`download_limit`、`password` |
-| `POST` | `/api/imgbed/upload` | 文件上传入口（小文件）。Telegram 模式直发 Bot API `sendDocument`（返回 `tg://<file_id>`）；ImgBed 模式流式代理到其 `/upload`，返回 `{ id, src }`（`id` 即 ImgBed 文件 key） |
+| `POST` | `/api/share` | 创建分享。`multipart`：`type=text\|file`、`text`、`file_key`+`upload_token`+`file_name`+`file_type`+`file_size`（文件先经 `/api/imgbed/upload` 上传，`upload_token` 由上传接口返回）、`expire_ms`、`download_limit`、`password` |
+| `POST` | `/api/imgbed/upload` | 文件上传入口（小文件）。Telegram 模式直发 Bot API `sendDocument`；ImgBed 模式流式代理到其 `/upload`。返回 `{ id, src, upload_token }`（`id` 即文件 key，`upload_token` 1 小时有效） |
 | `POST` | `/api/chunk/init` | 客户端分块上传初始化（仅 Telegram 模式），返回 `{ chunkSize }`（当前 16MB） |
-| `POST` | `/api/chunk/upload` | 上传单个分片（仅 Telegram 模式）。`multipart`：`file` + `index` + `fileName`，返回 `{ success, index, fileId, size, fileName }` |
-| `POST` | `/api/chunk/merge` | 汇总分片元信息（仅 Telegram 模式）。`json`：`{ fileName, fileType, totalChunks, chunks }`，返回 `{ id, src }`（`id` 即分片 `file_key`，形如 `c:...`） |
+| `POST` | `/api/chunk/upload` | 上传单个分片（仅 Telegram 模式）。`multipart`：`file` + `index` + `fileName`，返回 `{ success, index, fileId, size, fileName, chunkToken }`（`chunkToken` 1 小时有效） |
+| `POST` | `/api/chunk/merge` | 汇总分片元信息（仅 Telegram 模式）。`json`：`{ fileName, fileType, totalChunks, chunks }`（`chunks` 必须带 `chunkToken`），返回 `{ id, src, upload_token }`（`id` 即分片 `file_key`，形如 `c:...`） |
 | `GET` | `/api/share/:code` | 分享元信息（不消耗） |
-| `POST` | `/api/share/:code/claim` | 取件（消耗一次）。文本直接返回；文件返回 `/file/:key?t=TOKEN` |
-| `GET` | `/file/:key?t=TOKEN` | 校验防直链 token 后：ImgBed 模式 302 跳转到 ImgBed 原地址；Telegram 模式由 Worker 服务端取回字节返回（bot token 不出服务端） |
+| `POST` | `/api/share/:code/claim` | 取件（原子消耗一次）。文本直接返回；文件返回 `/file/:key?c=CODE&t=TOKEN`（token 10 分钟过期） |
+| `GET` | `/file/:key?c=CODE&t=TOKEN` | 校验短时 token + 分享状态后：ImgBed 模式 302 跳转到 ImgBed 原地址；Telegram 模式由 Worker 服务端取回字节以附件返回（bot token 不出服务端，强制 attachment + nosniff） |
 | `POST` | `/api/admin/login` | 登录（用 `ADMIN_KEY` 密码）；若已设 `ADMIN_API_TOKEN` 可跳过本步，直接 `Bearer <token>` 调管理接口 |
 | `GET` | `/api/admin/stats` | 统计（需 `Authorization: Bearer <token>`；设 `ADMIN_API_TOKEN` 后可直接用该 token） |
 | `GET` | `/api/admin/shares` | 分享列表（需 Bearer token） |
@@ -216,7 +219,9 @@ curl -X DELETE -H "Authorization: Bearer $FCB_TOKEN" $FCB/api/admin/share/ABCD12
 ## 说明与边界
 
 - **存储后端**：文件二进制只存在于你选的后端——ImgBed 的 R2（经其 `/upload` 写入，可被 ImgBed 自身 `/file/<key>` 直接访问）或 Telegram 的频道/群组（经 Bot API `sendDocument` 写入）。ImgBed 模式下删除分享会（配置了 `IMG_BED_ADMIN_TOKEN` 时）同步删除 ImgBed 侧对象；Telegram 模式下删除分享仅删取件码，**不**删 Telegram 侧消息。
-- **大文件 / 分片**：文件上传由本 Worker 把请求体**流式转发**给 ImgBed 的 `/upload`，由 ImgBed 完成存储，完全不受 Worker 请求体大小限制；分片上传同样由 ImgBed 处理。
+- **大文件 / 分片**：文件上传由本 Worker 把请求体**流式转发**给 ImgBed 的 `/upload`，由 ImgBed 完成存储。流式转发避免 Worker 自己缓冲整段文件，但**仍受 Cloudflare Workers 请求体上限约束**（通常 100MB，企业版更高）；更大的文件请使用客户端分块上传。
 - **Cron 清理**：Worker 的 `scheduled` 触发器每天 04:00 清理失效分享，并在配置了管理 token 时回收 ImgBed 对象，也可在后台手动「清理过期」。
 - **无需 R2 CORS**：浏览器不再跨域直传 R2（那套预签名方案已移除），因此也无需在 R2 桶配置 CORS。跨域访问统一经本 Worker 的 302 跳转完成。
-- **安全**：密码以 SHA-256 存储；文件直链带 HMAC 防直链 token；后台接口需 Bearer token。所有密钥均通过 Cloudflare 控制台的 Variables and Secrets 设置（建议 `ADMIN_KEY` 用 Secret 类型），**不**写进 `wrangler.toml` 或提交到仓库。
+- **安全**：密码使用 PBKDF2（随机盐 + 10 万次迭代）存储，并兼容校验旧 SHA-256 记录；文件直链 token 绑定分享码、10 分钟过期，`/file` 还会校验分享是否存在/未过期；上传/分片使用独立 `upload_token`/`chunkToken`，防止任意引用他人文件；Telegram 模式文件响应强制 `attachment` + `nosniff`（ImgBed 模式仍为 302，由 ImgBed 决定其响应头）；后台接口需 Bearer token，管理接口不再返回通配 CORS。所有密钥均通过 Cloudflare 控制台的 Variables and Secrets 设置（建议 `ADMIN_KEY`、`FILE_SECRET` 用 Secret 类型），**不**写进 `wrangler.toml` 或提交到仓库。
+- **升级提示**：旧版 `/file/:key?t=...` 直链（缺少 `c=` 分享码）会失效，请重新取件；旧分享的取件码仍可正常 claim 并生成新链接。旧版未带 `upload_token` 的建分享请求会被拒绝。
+- **限流建议**：代码内未内置跨 isolate 的分布式限流。公网部署时建议在 Cloudflare 控制台为 `/api/admin/login`、`/api/share/:code/claim`、`/api/imgbed/upload` 配置 Rate Limiting，或给寄件/上传入口接入 Turnstile，以降低密码/取件码爆破和上传配额滥用风险。

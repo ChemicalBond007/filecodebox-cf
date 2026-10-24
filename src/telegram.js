@@ -1,4 +1,10 @@
-import { fileToken } from './auth.js';
+import {
+  verifyFileToken,
+  isValidFileKey,
+  uploadToken,
+  chunkToken,
+  verifyChunkToken,
+} from './auth.js';
 
 // FileCodeBox-CF · Telegram 存储后端（移植自 CloudFlare-ImgBed 的 telegramAPI.js）
 //
@@ -21,9 +27,9 @@ import { fileToken } from './auth.js';
 
 // 分片大小：卡 getFile 下载上限 20MB，留 4MB 余量（与 CloudFlare-ImgBed 一致）
 export const CHUNK_SIZE = 16 * 1024 * 1024; // 16MiB
-// 分片数：无理论上限。客户端分块上传（init→chunk→merge）逐片独立请求，受 1 小时会话超时约束；
-// 服务端自动分片（uploadToTelegram）在单次 Worker 请求内连续调 sendDocument，受 Worker CPU 时间约束。
-// 不在代码里设硬上限——与 CloudFlare-ImgBed 的客户端分块逻辑一致。
+// 分片数防护上限：避免 merge 接受超大数组造成 Worker CPU/内存或 Telegram API 滥用。
+// 1000 片 × 16MiB 已远超实际使用场景。
+export const MAX_CHUNKS = 1000;
 
 // base64url 编解码（纯 ASCII 的 chunks JSON，跨 Cloudflare Workers / Node 均可用）
 function toB64Url(str) {
@@ -135,16 +141,21 @@ export async function uploadToTelegram(env, request) {
   if (fileSize <= CHUNK_SIZE) {
     const resp = await tg.sendFile(file, env.TG_CHAT_ID, 'sendDocument', 'document', '', fileName);
     const info = tg.getFileInfo(resp);
-    if (!info || !info.file_id) {
-      throw new Error('Telegram 未返回 file_id: ' + JSON.stringify(resp).slice(0, 200));
+    if (!info || !info.file_id || !isValidFileKey(info.file_id)) {
+      throw new Error('Telegram 未返回合法 file_id: ' + JSON.stringify(resp).slice(0, 200));
     }
-    return { id: info.file_id, src: `tg://${info.file_id}` };
+    return {
+      id: info.file_id,
+      src: `tg://${info.file_id}`,
+      upload_token: await uploadToken(env, info.file_id),
+    };
   }
 
   // 大文件：按 16MB 分片，每片单独 sendDocument。
   // 注：服务端自动分片是在「单次 Worker 请求」内连续调 sendDocument，受 Worker CPU 时间约束；
   // 真正的大文件请走前端客户端分块上传（init→chunk→merge，逐片独立请求，无分片数理论上限）。
   const totalChunks = Math.ceil(fileSize / CHUNK_SIZE);
+  if (totalChunks > MAX_CHUNKS) throw new Error(`分片数量超过上限（${MAX_CHUNKS}）`);
   const chunks = [];
   for (let i = 0; i < totalChunks; i++) {
     const start = i * CHUNK_SIZE;
@@ -160,13 +171,13 @@ export async function uploadToTelegram(env, request) {
       chunkFileName
     );
     const info = tg.getFileInfo(resp);
-    if (!info || !info.file_id) {
+    if (!info || !info.file_id || !isValidFileKey(info.file_id)) {
       throw new Error(`分片 ${i + 1}/${totalChunks} 上传失败: ` + JSON.stringify(resp).slice(0, 200));
     }
     chunks.push({
       index: i,
       fileId: info.file_id,
-      size: info.file_size ?? end - start,
+      size: Number(info.file_size ?? end - start),
       fileName: chunkFileName,
     });
   }
@@ -174,45 +185,99 @@ export async function uploadToTelegram(env, request) {
     throw new Error(`分片数量不一致：期望 ${totalChunks}，实际 ${chunks.length}`);
   }
   const id = 'c:' + toB64Url(JSON.stringify(chunks));
-  return { id, src: `tg://chunked:${chunks.length}` };
+  return {
+    id,
+    src: `tg://chunked:${chunks.length}`,
+    upload_token: await uploadToken(env, id),
+  };
 }
 
 // 单分片上传（供前端客户端分块上传的 /api/chunk/upload 调用）：把一片 Blob 单独 sendDocument 到 Telegram。
-// 返回 { fileId, size, fileName }，前端收集各片后交给 assembleChunkedKey 组装 file_key。
-export async function uploadChunk(env, blob, fileName) {
+// 返回 { fileId, size, fileName, chunkToken }，前端收集各片后交给 merge 校验并组装 file_key。
+export async function uploadChunk(env, blob, fileName, index) {
   if (!env.TG_BOT_TOKEN) throw new Error('未配置 TG_BOT_TOKEN（Telegram Bot Token）');
   if (!env.TG_CHAT_ID) throw new Error('未配置 TG_CHAT_ID（文件要发往的频道/群组 ID）');
   const tg = new TelegramAPI(env.TG_BOT_TOKEN, env.TG_API || '');
   const resp = await tg.sendFile(blob, env.TG_CHAT_ID, 'sendDocument', 'document', '', fileName);
   const info = tg.getFileInfo(resp);
-  if (!info || !info.file_id) {
+  if (!info || !info.file_id || !isValidFileKey(info.file_id)) {
     throw new Error('分片上传失败: ' + JSON.stringify(resp).slice(0, 200));
   }
-  return { fileId: info.file_id, size: info.file_size ?? blob.size, fileName };
+  const size = Number(info.file_size ?? blob.size ?? 0);
+  if (!Number.isFinite(size) || size < 0) throw new Error('分片大小无效');
+  return {
+    fileId: info.file_id,
+    size,
+    fileName,
+    chunkToken: await chunkToken(env, info.file_id, size, index),
+  };
 }
 
 // 把各分片元信息组装成分片 file_key（c: + base64url(JSON)），与取件端 serveFromTelegram 约定一致。
+// 只保留必要字段，chunkToken 不进入 file_key。
 export function assembleChunkedKey(chunks) {
   if (!Array.isArray(chunks) || !chunks.length) throw new Error('分片为空');
+  if (chunks.length > MAX_CHUNKS) throw new Error(`分片数量超过上限（${MAX_CHUNKS}）`);
   const sorted = [...chunks].sort((a, b) => a.index - b.index);
-  return 'c:' + toB64Url(JSON.stringify(sorted));
+  for (let i = 0; i < sorted.length; i++) {
+    if (sorted[i].index !== i) throw new Error('分片序号不连续');
+  }
+  const normalized = sorted.map((c) => {
+    const size = Number(c.size);
+    if (!Number.isFinite(size) || size < 0) throw new Error('分片大小非法');
+    return {
+      index: c.index,
+      fileId: c.fileId,
+      size,
+      fileName: String(c.fileName || '').slice(0, 255),
+    };
+  });
+  return 'c:' + toB64Url(JSON.stringify(normalized));
 }
 
-// 取件服务端文件名（RFC 5987：中文等非 ASCII 用 filename* 编码，浏览器优先取之）
+// merge 时校验每个分片的上传凭证，避免客户端直接引用任意 Telegram file_id。
+export async function verifyAndAssembleChunkedKey(env, chunks) {
+  if (!Array.isArray(chunks) || !chunks.length) throw new Error('分片列表为空');
+  if (chunks.length > MAX_CHUNKS) throw new Error(`分片数量超过上限（${MAX_CHUNKS}）`);
+  const seen = new Set();
+  for (const c of chunks) {
+    if (!Number.isInteger(c.index) || c.index < 0) throw new Error('分片序号无效');
+    if (seen.has(c.index)) throw new Error('分片序号重复');
+    seen.add(c.index);
+    if (typeof c.fileId !== 'string' || !isValidFileKey(c.fileId)) throw new Error('分片 file_id 非法');
+    if (!Number.isFinite(c.size) || c.size < 0) throw new Error('分片大小非法');
+    const ok = await verifyChunkToken(env, c.fileId, c.size, c.index, c.chunkToken);
+    if (!ok) throw new Error(`分片 ${c.index} 凭证无效`);
+  }
+  const id = assembleChunkedKey(chunks);
+  return { id, upload_token: await uploadToken(env, id) };
+}
+
+// 取件文件名（RFC 5987：中文等非 ASCII 用 filename* 编码，浏览器优先取之）。
+// 强制 attachment，避免用户上传的 HTML/SVG 在本站同源被浏览器渲染执行。
 function dispositionValue(name) {
-  if (!name) return 'inline';
-  const asciiName = String(name).replace(/[^\x20-\x7E]/g, '_');
-  const encoded = encodeURIComponent(name);
-  return `inline; filename="${asciiName}"; filename*=UTF-8''${encoded}`;
+  const safeName = String(name || 'file');
+  const asciiName = safeName.replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '_');
+  const encoded = encodeURIComponent(safeName);
+  return `attachment; filename="${asciiName}"; filename*=UTF-8''${encoded}`;
 }
 
-// 取件：先校验 HMAC 防直链 token，再在服务端用 bot token 取回文件内容并流式返回。
+function baseDownloadHeaders(disposition) {
+  const headers = new Headers();
+  headers.set('Content-Type', 'application/octet-stream');
+  headers.set('Content-Disposition', disposition);
+  headers.set('X-Content-Type-Options', 'nosniff');
+  headers.set('Cache-Control', 'private, no-store');
+  return headers;
+}
+
+// 取件：先校验短时 token，再在服务端用 bot token 取回文件内容并流式返回。
 // 分片文件按序串联各片（支持 Range / HEAD）；单文件直接透传（不占内存）。
-// meta（file_name / file_type）用于设置正确的 Content-Type 与下载文件名。
-export async function serveFromTelegram(env, request, key, meta) {
+// 响应统一 attachment + application/octet-stream，避免 Content-Type 由用户控制。
+export async function serveFromTelegram(env, request, key, code, meta) {
+  if (!isValidFileKey(key)) return new Response('无效的文件标识', { status: 400 });
   const token = new URL(request.url).searchParams.get('t');
-  const expected = await fileToken(env, key);
-  if (!token || token !== expected) {
+  if (!token || !(await verifyFileToken(env, key, code, token))) {
     return new Response('无效或缺失的访问凭证', { status: 403 });
   }
   const tg = new TelegramAPI(env.TG_BOT_TOKEN, env.TG_API || '');
@@ -225,13 +290,26 @@ export async function serveFromTelegram(env, request, key, meta) {
     } catch (e) {
       return new Response('分片信息损坏', { status: 502 });
     }
-    if (!Array.isArray(chunks) || !chunks.length) {
-      return new Response('分片信息为空', { status: 502 });
+    if (!Array.isArray(chunks) || !chunks.length || chunks.length > MAX_CHUNKS) {
+      return new Response('分片信息无效', { status: 502 });
     }
     chunks.sort((a, b) => a.index - b.index);
+    for (let i = 0; i < chunks.length; i++) {
+      const c = chunks[i];
+      if (
+        !c ||
+        c.index !== i ||
+        typeof c.fileId !== 'string' ||
+        !isValidFileKey(c.fileId) ||
+        !Number.isFinite(c.size) ||
+        c.size < 0
+      ) {
+        return new Response('分片信息损坏', { status: 502 });
+      }
+    }
   }
 
-  const contentType = (meta && meta.file_type) || 'application/octet-stream';
+  // 不信任客户端提交的 file_type：统一以二进制附件返回，避免 HTML/SVG 同源执行。
   const disposition = dispositionValue(meta && meta.file_name);
 
   // ---- 单文件：直接透传 Telegram 响应体（不读入内存），保留原行为 ----
@@ -240,12 +318,11 @@ export async function serveFromTelegram(env, request, key, meta) {
     try {
       resp = await tg.getFileContent(key);
     } catch (e) {
-      return new Response('Telegram 取文件失败: ' + e.message, { status: 502 });
+      console.error('[telegram download]', e);
+      return new Response('Telegram 取文件失败', { status: 502 });
     }
     if (!resp.ok) return new Response('Telegram 取文件失败', { status: 502 });
-    const headers = new Headers();
-    headers.set('Content-Type', contentType);
-    headers.set('Content-Disposition', disposition);
+    const headers = baseDownloadHeaders(disposition);
     const len = resp.headers.get('Content-Length');
     if (len) headers.set('Content-Length', len);
     if (request.method === 'HEAD') return new Response(null, { status: 200, headers });
@@ -274,9 +351,7 @@ export async function serveFromTelegram(env, request, key, meta) {
   }
 
   if (request.method === 'HEAD') {
-    const h = new Headers();
-    h.set('Content-Type', contentType);
-    h.set('Content-Disposition', disposition);
+    const h = baseDownloadHeaders(disposition);
     h.set('Accept-Ranges', 'bytes');
     if (isRange) {
       h.set('Content-Range', `bytes ${rangeStart}-${rangeEnd}/${totalSize}`);
@@ -287,9 +362,7 @@ export async function serveFromTelegram(env, request, key, meta) {
     return new Response(null, { status: 200, headers: h });
   }
 
-  const headers = new Headers();
-  headers.set('Content-Type', contentType);
-  headers.set('Content-Disposition', disposition);
+  const headers = baseDownloadHeaders(disposition);
   headers.set('Accept-Ranges', 'bytes');
 
   // 流式重组：只下载与 Range 相交的分片，避免整文件读入内存

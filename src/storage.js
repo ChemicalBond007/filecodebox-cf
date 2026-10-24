@@ -4,15 +4,13 @@
 // ImgBed 实例 —— 它本就跑在 Cloudflare 上，原生支持大文件 / 分片上传 / R2 存储
 // 与图床后台。FileCodeBox 只负责「取件码层」：
 //   · 上传：把请求体流式代理到 ImgBed 的 /upload（不缓冲，大文件直穿）
-//   · 取件：返回 /file/:id 直链，校验防直链 token 后 302 跳转到 ImgBed 原地址
-//   · 删除：可选同步清理 ImgBed 侧对象
-//
-// 因此本项目不再需要直接绑定 img_r2 / img_d1，只需配置 IMG_BED_URL（+ 可选 token）。
+//   · 取件：校验短时防直链 token 后 302 跳转到 ImgBed 原地址
+//   · 删除：可选同步清理 ImgBed 侧对象（只删除本应用登记过的合法 key）
 
-import { fileToken } from './auth.js';
+import { verifyFileToken, isValidFileKey, uploadToken } from './auth.js';
 
 // 把请求体流式转发到 ImgBed 的 /upload，由 ImgBed 完成存储。
-// 返回 { id, src }，其中 id 即 ImgBed 的文件 key。
+// 返回 { id, src, upload_token }，其中 upload_token 用于创建分享时证明来源。
 export async function uploadToImgBed(env, request) {
   const base = env.IMG_BED_URL;
   if (!base) throw new Error('未配置 IMG_BED_URL（ImgBed 部署地址）');
@@ -26,7 +24,6 @@ export async function uploadToImgBed(env, request) {
   if (env.IMG_BED_UPLOAD_CHANNEL) url.searchParams.set('uploadChannel', env.IMG_BED_UPLOAD_CHANNEL);
 
   // 流式转发：body 是 ReadableStream，运行时不会缓冲整段，大文件直穿到 ImgBed
-  // 构造请求头：ImgBed 的 API Token 通过 Authorization: Bearer 传递（最常见形态，前缀常为 imgbed_）
   const headers = { 'Content-Type': request.headers.get('Content-Type') || 'application/octet-stream' };
   if (env.IMG_BED_UPLOAD_TOKEN) headers['Authorization'] = 'Bearer ' + env.IMG_BED_UPLOAD_TOKEN;
   const upstream = await fetch(url.toString(), {
@@ -34,7 +31,7 @@ export async function uploadToImgBed(env, request) {
     headers,
     body: request.body,
     redirect: 'manual',
-    duplex: 'half', // Node/undici 转发流时必须；Cloudflare 运行时忽略此字段，跨运行时安全
+    duplex: 'half', // Node/undici 转发流时必须；Cloudflare 运行时忽略此字段
   });
 
   if (upstream.status >= 400) {
@@ -47,30 +44,38 @@ export async function uploadToImgBed(env, request) {
   const src = first && (first.src || first.url);
   if (!src) throw new Error('ImgBed 未返回文件地址');
   const id = String(src).split('/file/')[1]?.split('?')[0];
-  if (!id) throw new Error('无法解析 ImgBed 文件 id');
-  return { id, src };
+  if (!id || !isValidFileKey(id)) throw new Error('无法解析 ImgBed 文件 id');
+  return { id, src, upload_token: await uploadToken(env, id) };
 }
 
-// 取件直链：校验防直链 token 后 302 跳转到 ImgBed 原地址，
+// 取件直链：校验短时防直链 token 后 302 跳转到 ImgBed 原地址。
 // 实际传输（含 Range / 大文件流式）由 ImgBed 负责。
-export async function serveFromImgBed(env, request, id) {
+export async function serveFromImgBed(env, request, id, code) {
+  if (!isValidFileKey(id)) return new Response('无效的文件标识', { status: 400 });
+
   const token = new URL(request.url).searchParams.get('t');
-  const expected = await fileToken(env, id);
-  if (!token || token !== expected) {
+  if (!token || !(await verifyFileToken(env, id, code, token))) {
     return new Response('无效或缺失的访问凭证', { status: 403 });
   }
   const base = env.IMG_BED_URL;
   if (!base) return new Response('未配置 IMG_BED_URL', { status: 500 });
-  const location = new URL('/file/' + id, base).toString();
-  return new Response(null, { status: 302, headers: { Location: location } });
+
+  const location = new URL('/file/' + encodeURIComponent(id), base).toString();
+  return new Response(null, {
+    status: 302,
+    headers: { Location: location, 'Cache-Control': 'no-store' },
+  });
 }
 
-// 删除分享时可选同步清理 ImgBed 侧对象（需配置 IMG_BED_ADMIN_TOKEN）
+// 删除分享时可选同步清理 ImgBed 侧对象（需配置 IMG_BED_ADMIN_TOKEN）。
+// 只接受合法、非分片的 key，并使用 encodeURIComponent，避免 `../` 改写删除路径。
 export async function deleteFromImgBed(env, id) {
   const base = env.IMG_BED_URL;
   if (!base || !env.IMG_BED_ADMIN_TOKEN) return;
-  const url = new URL('/api/manage/delete/' + id, base);
+  if (!id || String(id).startsWith('c:') || !isValidFileKey(String(id))) return;
+
   try {
+    const url = new URL('/api/manage/delete/' + encodeURIComponent(String(id)), base);
     await fetch(url.toString(), {
       method: 'DELETE',
       headers: { Authorization: 'Bearer ' + env.IMG_BED_ADMIN_TOKEN },
