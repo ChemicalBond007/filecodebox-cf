@@ -8,9 +8,17 @@ import {
   fileToken,
   verifyUploadToken,
   isValidFileKey,
+  hmac,
+  sha256,
 } from './auth.js';
 import { getAdminSession } from './admin.js';
-import { EXPIRE_PRESETS, DOWNLOAD_PRESETS, appName, appSubtitle } from './config.js';
+import {
+  EXPIRE_PRESETS, DOWNLOAD_PRESETS, appName, appSubtitle, MAX_TEXT_BYTES,
+  MAX_SHARE_BODY_BYTES, MAX_CLAIM_BODY_BYTES, FILE_TOKEN_TTL, PASSWORD_WINDOW_MS,
+  PASSWORD_PAIR_LIMIT, PASSWORD_CODE_LIMIT,
+} from './config.js';
+import { fields, HttpError } from './http.js';
+import { encryptText, decryptText } from './text.js';
 
 export function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -34,22 +42,8 @@ export function isDepleted(row) {
 
 // POST /api/share  —— 创建分享（文本或文件）
 export async function createShare({ request, env }) {
-  let form;
-  const ct = request.headers.get('Content-Type') || '';
-  if (ct.includes('application/json')) {
-    const body = await request.json().catch(() => ({}));
-    // 把 JSON 包成伪 form，便于复用同一套逻辑
-    form = {
-      get(k) {
-        return body[k] ?? null;
-      },
-      async formData() {
-        return form;
-      },
-    };
-  } else {
-    form = await request.formData();
-  }
+  const body = await fields(request, MAX_SHARE_BODY_BYTES);
+  const form = { get: name => body[name] ?? null };
 
   const type = form.get('type');
   const text = form.get('text');
@@ -73,8 +67,7 @@ export async function createShare({ request, env }) {
 
   if (shareType === 'text') {
     if (typeof text !== 'string' || !text.trim()) return json({ error: '文本内容不能为空' }, 400);
-    if (text.length > 222 * 1024) return json({ error: '文本过长（上限 222KB）' }, 413);
-    row.text_content = text;
+    row.text_content = await encryptText(env, row.code, text);
   } else {
     // 文件模式：file_key 由上传接口返回；upload_token 证明该 key 确实由本 Worker 产生，
     // 防止客户端随便引用他人文件（也防止删除时误删 ImgBed 上的任意对象）。
@@ -124,9 +117,12 @@ export async function createShare({ request, env }) {
 
 // GET /api/share/:code  —— 查看分享元信息（不消耗次数）
 export async function getShareMeta({ params, env }) {
-  const row = await db.getShare(env.fcb_db, params.code);
+  const row = await db.getShareMeta(env.fcb_db, params.code);
   if (!row) return json({ error: '取件码不存在' }, 404);
-  if (isExpired(row)) return json({ error: '该分享已过期', code: params.code, expired: true }, 410);
+  if (isExpired(row)) {
+    if (row.type === 'text') await db.deleteExpiredText(env.fcb_db, params.code);
+    return json({ error: '该分享已过期', code: params.code, expired: true }, 410);
+  }
   if (isDepleted(row)) return json({ error: '该分享已达取件上限', code: params.code, depleted: true }, 410);
 
   const base = {
@@ -135,7 +131,7 @@ export async function getShareMeta({ params, env }) {
     expire_at: row.expire_at,
     download_limit: row.download_limit,
     downloads: row.downloads,
-    has_password: !!row.password,
+    has_password: !!row.has_password,
     remaining: row.download_limit > 0 ? Math.max(0, row.download_limit - row.downloads) : null,
   };
   if (row.type === 'file') {
@@ -146,42 +142,80 @@ export async function getShareMeta({ params, env }) {
   return json(base);
 }
 
-// POST /api/share/:code/claim  —— 取件（原子消耗一次）
+async function checkSharePassword(request, env, row, provided) {
+  if (typeof provided !== 'string') throw new HttpError(400, '密码必须为字符串');
+  if (!provided) return json({ error: '请输入分享密码', requiresPassword: true }, 401);
+  if (provided.length > 1024) throw new HttpError(413, '密码过长');
+  const now = Date.now();
+  const bucket = Math.floor(now / PASSWORD_WINDOW_MS);
+  const expires = (bucket + 1) * PASSWORD_WINDOW_MS;
+  const secret = env.FILE_SECRET || env.TEXT_ENCRYPTION_KEY || env.ADMIN_KEY || env.ADMIN_API_TOKEN;
+  if (!secret) throw new HttpError(503, '未配置限流签名密钥');
+  const ip = request.headers.get('CF-Connecting-IP') || 'local';
+  const pair = await hmac(secret, `share-pair|${row.code}|${ip}|${bucket}`);
+  const shared = await hmac(secret, `share-code|${row.code}|${bucket}`);
+  const first = await db.passwordAttempt(env.fcb_db, pair, expires);
+  const second = first.attempts <= PASSWORD_PAIR_LIMIT
+    ? await db.passwordAttempt(env.fcb_db, shared, expires) : null;
+  if (!second || second.attempts > PASSWORD_CODE_LIMIT) {
+    const response = json({ error: '密码尝试过于频繁，请稍后重试', requiresPassword: true }, 429);
+    response.headers.set('Retry-After', String(Math.max(1, Math.ceil((expires - now) / 1000))));
+    return response;
+  }
+  if (!(await verifyPassword(provided, row.password))) {
+    return json({ error: '密码错误', requiresPassword: true }, 401);
+  }
+  await db.passwordAccepted(env.fcb_db, pair, shared);
+  return null;
+}
+
+// Idempotency-Key 必须由客户端为一次取件生成，十分钟内重试不重复扣减。
 export async function claimShare({ request, params, env }) {
+  const id = request.headers.get('Idempotency-Key') || '';
+  if (!/^[A-Za-z0-9_-]{16,128}$/.test(id)) {
+    return json({ error: '必须提供 16–128 位 Idempotency-Key，请升级客户端' }, 400);
+  }
+  const input = await fields(request, MAX_CLAIM_BODY_BYTES, true);
   const row = await db.getShare(env.fcb_db, params.code);
   if (!row) return json({ error: '取件码不存在' }, 404);
-  if (isExpired(row)) return json({ error: '该分享已过期' }, 410);
-  if (isDepleted(row)) return json({ error: '该分享已达取件上限' }, 410);
+  if (isExpired(row)) {
+    if (row.type === 'text') await db.deleteExpiredText(env.fcb_db, params.code);
+    return json({ error: '该分享已过期' }, 410);
+  }
+  const hash = await sha256(`${params.code}|${id}`);
+  let receipt = await db.getClaimReceipt(env.fcb_db, params.code, hash);
+  if (!receipt && isDepleted(row)) return json({ error: '该分享已达取件上限' }, 410);
 
   // 密码校验
   if (row.password) {
-    let provided = '';
-    const ct = request.headers.get('Content-Type') || '';
-    if (ct.includes('application/json')) {
-      const b = await request.json().catch(() => ({}));
-      provided = b.password || '';
-    } else {
-      const f = await request.formData().catch(() => null);
-      provided = f ? f.get('password') || '' : '';
-    }
-    const ok = await verifyPassword(String(provided), row.password);
-    if (!ok) return json({ error: '密码错误', requiresPassword: true }, 401);
+    const denied = await checkSharePassword(request, env, row, input.password ?? '');
+    if (denied) return denied;
   }
 
   if (row.type === 'file' && !isValidFileKey(row.file_key)) {
     return json({ error: '文件记录无效' }, 500);
   }
 
-  // 条件 UPDATE：并发取件时最多只有一个请求能成功扣减，避免超发。
-  const consumed = await db.consumeDownload(env.fcb_db, params.code);
-  if (!consumed) return json({ error: '该分享已达取件上限或已过期' }, 410);
+  // 解密/校验必须在扣减之前，配置错误或损坏数据不能消耗次数。
+  const text = row.type === 'text'
+    ? await decryptText(env, params.code, await db.getShareText(env.fcb_db, params.code)) : null;
+  const now = Date.now();
+  if (isExpired(row, now)) {
+    if (row.type === 'text') await db.deleteExpiredText(env.fcb_db, params.code, now);
+    return json({ error: '该分享已过期' }, 410);
+  }
+  if (receipt && receipt.expires_at <= now) receipt = null;
+  const expires = row.expire_at ? Math.min(row.expire_at, now + FILE_TOKEN_TTL) : now + FILE_TOKEN_TTL;
+  receipt ||= await db.consumeClaim(env.fcb_db, params.code, hash, expires, now);
+  if (!receipt) return json({ error: '该分享已达取件上限或已过期' }, 410);
 
   if (row.type === 'text') {
-    return json({ type: 'text', text: row.text_content });
+    return json({ type: 'text', text });
   }
 
   // 文件：签发短时防直链 token（绑定 share code + file key），返回可直接访问的 URL。
-  const token = await fileToken(env, row.file_key, params.code);
+  const token = await fileToken(env, row.file_key, params.code,
+    receipt.expires_at - receipt.created_at, receipt.created_at);
   const query = new URLSearchParams({ c: params.code, t: token });
   return json({
     type: 'file',
@@ -256,6 +290,7 @@ export async function publicConfig({ env }) {
     expirePresets: EXPIRE_PRESETS,
     downloadPresets: DOWNLOAD_PRESETS,
     storage: env.TG_BOT_TOKEN && env.TG_CHAT_ID ? 'Telegram (Bot API)' : 'CloudFlare-ImgBed (API)',
+    maxTextBytes: MAX_TEXT_BYTES,
   });
 }
 

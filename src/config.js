@@ -20,6 +20,13 @@ export const DOWNLOAD_PRESETS = [1, 10, 100, 0];
 
 // 文件直链 token 有效期（毫秒），仅作轻量防直链，过期后需重新取件
 export const FILE_TOKEN_TTL = 10 * 60 * 1000;
+export const MAX_TEXT_BYTES = 222 * 1024; // UTF-8 字节，222 KiB，不是字符数
+export const MAX_SHARE_BODY_BYTES = MAX_TEXT_BYTES * 6 + 64 * 1024; // JSON 转义最多放大六倍
+export const MAX_CLAIM_BODY_BYTES = 16 * 1024;
+export const PASSWORD_WINDOW_MS = 5 * 60 * 1000;
+export const PASSWORD_PAIR_LIMIT = 5;
+export const PASSWORD_CODE_LIMIT = 30;
+export const AUTO_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 export function appName(env) {
   return env.APP_NAME || '文件快递柜';

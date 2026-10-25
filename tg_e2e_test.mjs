@@ -26,7 +26,9 @@ async function uploadAndShare(payload, fileName, fileType) {
   const create = await fetch(`${BASE}/api/share`, { method: 'POST', body: sf });
   const createJson = await create.json();
   if (!create.ok || !createJson.code) throw new Error('创建分享失败：' + JSON.stringify(createJson));
-  const claim = await (await fetch(`${BASE}/api/share/${createJson.code}/claim`, { method: 'POST' })).json();
+  const claim = await (await fetch(`${BASE}/api/share/${createJson.code}/claim`, {
+    method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() },
+  })).json();
   if (!claim.ok && !claim.url) throw new Error('取件失败：' + JSON.stringify(claim));
   return { upJson, claimUrl: claim.url };
 }
@@ -72,7 +74,9 @@ async function clientChunkUpload(payload, fileName, fileType, legacyChunkSize) {
   sf.append('file_size', String(payload.length));
   const create = await fetch(`${BASE}/api/share`, { method: 'POST', body: sf });
   const createJson = await create.json();
-  const claim = await (await fetch(`${BASE}/api/share/${createJson.code}/claim`, { method: 'POST' })).json();
+  const claim = await (await fetch(`${BASE}/api/share/${createJson.code}/claim`, {
+    method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() },
+  })).json();
   return { claimUrl: claim.url, mergeId: merge.id };
 }
 

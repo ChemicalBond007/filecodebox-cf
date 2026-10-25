@@ -5,7 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { readFileSync } from 'node:fs';
 import worker from './src/worker.js';
 import { hmac, fileToken } from './src/auth.js';
-import { bindTestAdmin } from './tests/helpers.mjs';
+import { bindTestAdmin, TEST_TEXT_KEY } from './tests/helpers.mjs';
 
 // ---- 内存 SQLite 模拟 D1（仅 fcb_db，分享元数据） ----
 const sqlite = new DatabaseSync(':memory:');
@@ -113,6 +113,7 @@ const env = {
   ADMIN_API_TOKEN: 'local-bootstrap',
   ADMIN_ORIGIN: 'https://x.com',
   FILE_SECRET: 'filesec',
+  TEXT_ENCRYPTION_KEY: TEST_TEXT_KEY,
   APP_NAME: 'T',
   APP_SUBTITLE: 'S',
   IMG_BED_ADMIN_TOKEN: 'imgbed-admin', // 让 deleteFromImgBed 真正触发清理
@@ -125,13 +126,19 @@ function ok(cond, msg) { if (cond) { pass++; } else { fail++; console.error('   
 function eq(a, b, msg) { ok(a === b, `${msg} (期望 ${JSON.stringify(b)}, 实际 ${JSON.stringify(a)})`); }
 
 async function call(method, path, body, headers = {}) {
+  if (method === 'POST' && path.endsWith('/claim')) headers = { 'Idempotency-Key': crypto.randomUUID(), ...headers };
   if (path.startsWith('/api/admin/') && !['GET', 'HEAD'].includes(method)) {
     headers = { Origin: env.ADMIN_ORIGIN, 'Content-Type': 'application/json', ...headers };
   }
   const init = { method, headers };
   if (body instanceof FormData) init.body = body;
   else if (body !== undefined) { init.body = JSON.stringify(body); init.headers = { 'Content-Type': 'application/json', ...headers }; }
-  return worker.fetch(new Request('https://x.com' + path, init), env, { waitUntil() {} });
+  const jobs = [];
+  const response = await worker.fetch(new Request('https://x.com' + path, init), env, {
+    waitUntil(promise) { jobs.push(promise); },
+  });
+  await Promise.all(jobs);
+  return response;
 }
 function fd(obj) {
   const f = new FormData();
@@ -310,7 +317,6 @@ let adminCookie;
   ok(sweep.cleaned >= 1, 'sweep 清理了至少 1 条: ' + sweep.cleaned);
   ok(deletedIds.includes(up.id) || !uploaded[up.id], 'sweep 同步清理了 ImgBed 侧的过期对象');
 
-  // 顺带验证 cron scheduled 路径不会抛错（直接调用 storage 入口已在上面覆盖）
 }
 
 console.log(`\n结果：通过 ${pass}，失败 ${fail}`);

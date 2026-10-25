@@ -9,6 +9,8 @@ function finish(response, request) {
   const headers = new Headers(response.headers);
   headers.delete('Set-Cookie');
   headers.delete('Location');
+  for (const name of ['Access-Control-Allow-Origin', 'Access-Control-Allow-Methods',
+    'Access-Control-Allow-Headers', 'Access-Control-Allow-Credentials', 'Access-Control-Max-Age']) headers.delete(name);
   headers.set('Cache-Control', 'no-store');
   headers.set('X-Content-Type-Options', 'nosniff');
   headers.set('X-Frame-Options', 'DENY');

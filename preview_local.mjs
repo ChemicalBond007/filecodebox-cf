@@ -19,6 +19,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import worker from './src/worker.js';
+import { randomBytes } from 'node:crypto';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(__dirname, 'public');
@@ -203,6 +204,7 @@ const env = {
   ADMIN_API_TOKEN: process.env.FCB_ADMIN_API_TOKEN || '',
   ADMIN_ORIGIN: process.env.FCB_ADMIN_ORIGIN || `http://localhost:${PORT}`,
   FILE_SECRET: 'preview-file-secret',
+  TEXT_ENCRYPTION_KEY: process.env.TEXT_ENCRYPTION_KEY || randomBytes(32).toString('hex'),
   APP_NAME: '文件快递柜',
   APP_SUBTITLE: '本地预览 · 委托 CloudFlare-ImgBed（mock）',
   IMG_BED_ADMIN_TOKEN: 'preview-imgbed-admin',

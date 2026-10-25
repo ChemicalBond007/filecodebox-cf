@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, generateKeyPairSync, randomBytes, sign } from 'node:crypto';
 import { isoCBOR } from '@simplewebauthn/server/helpers';
+export const TEST_TEXT_KEY = '12'.repeat(32); // 仅内存测试使用，不用于部署。
 
 export function memoryD1() {
   const sqlite = new DatabaseSync(':memory:');

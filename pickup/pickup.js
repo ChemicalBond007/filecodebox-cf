@@ -4,6 +4,7 @@
   const $ = s => document.querySelector(s);
   let receiving = false;
   let passwordCode = '';
+  let claimAttempt = null;
 
   function toast(message) {
     const el = $('#toast');
@@ -16,7 +17,9 @@
   async function api(path, options = {}) {
     const response = await fetch(path, { ...options, credentials: 'omit' });
     const data = await response.json().catch(() => null);
-    if (!response.ok) throw new Error(data?.error || `请求失败 (${response.status})`);
+    if (!response.ok) throw Object.assign(new Error(data?.error || `请求失败 (${response.status})`), {
+      status: response.status,
+    });
     if (!data) throw new Error('服务响应无效，请重试');
     return data;
   }
@@ -83,6 +86,8 @@
     if (receiving) return;
     const code = normalizeCode($('#codeInput').value);
     if (!code) { toast('请输入取件码'); return; }
+    const retry = claimAttempt?.code === code && Date.now() - claimAttempt.started < 10 * 60 * 1000;
+    if (!retry) claimAttempt = null;
     if (code !== passwordCode) {
       $('#receivePwd').value = '';
       $('#pwdRow').classList.add('hidden');
@@ -92,22 +97,30 @@
     const out = $('#receiveOut');
     out.replaceChildren(element('div', 'spinner', '取件中…'));
     try {
-      const meta = await api('/api/share/' + code);
-      if (meta.has_password) {
-        passwordCode = code;
-        $('#pwdRow').classList.remove('hidden');
-        if (!withPassword) {
-          out.replaceChildren();
-          return;
+      if (!retry) {
+        const meta = await api('/api/share/' + code);
+        if (meta.has_password) {
+          passwordCode = code;
+          $('#pwdRow').classList.remove('hidden');
+          if (!withPassword) {
+            out.replaceChildren();
+            return;
+          }
         }
       }
+      claimAttempt ||= { code, key: crypto.randomUUID(), started: Date.now(),
+        password: withPassword ? $('#receivePwd').value : '' };
       const body = new FormData();
-      if (withPassword) body.set('password', $('#receivePwd').value);
-      const claim = await api('/api/share/' + code + '/claim', { method: 'POST', body });
+      if (claimAttempt.password) body.set('password', claimAttempt.password);
+      const claim = await api('/api/share/' + code + '/claim', {
+        method: 'POST', body, headers: { 'Idempotency-Key': claimAttempt.key },
+      });
       showResult(claim);
+      claimAttempt = null;
       $('#pwdRow').classList.add('hidden');
       $('#receivePwd').value = '';
     } catch (error) {
+      if ([400, 401, 403, 404, 410, 413, 415, 429].includes(error.status)) claimAttempt = null;
       out.replaceChildren(element('div', 'msg err', error.message));
     } finally {
       setBusy(false);
@@ -124,6 +137,7 @@
     return doReceive(true);
   });
   $('#codeInput').addEventListener('input', () => {
+    claimAttempt = null;
     passwordCode = '';
     $('#receivePwd').value = '';
     $('#pwdRow').classList.add('hidden');

@@ -53,7 +53,7 @@ export async function hmac(secret, message) {
   return toBase64Url(new Uint8Array(sig));
 }
 
-// SHA-256，返回 hex（仅用于兼容旧版密码哈希）
+// SHA-256，返回 hex（旧版密码哈希兼容 / 幂等标识摘要）
 export async function sha256(str) {
   const buf = await crypto.subtle.digest('SHA-256', enc.encode(str));
   return toHex(new Uint8Array(buf));
@@ -127,8 +127,8 @@ function fileSecret(env) {
   return String(secret);
 }
 
-async function signToken(secret, payload, ttl) {
-  const exp = Date.now() + ttl;
+async function signToken(secret, payload, ttl, now = Date.now()) {
+  const exp = now + ttl;
   const sig = await hmac(secret, `${payload}|${exp}`);
   return `${exp}.${sig}`;
 }
@@ -145,8 +145,8 @@ async function verifyToken(secret, payload, token) {
 }
 
 // 文件直链 token：绑定 share code + file key + 过期时间
-export async function fileToken(env, key, code, ttl = FILE_TOKEN_TTL) {
-  return signToken(fileSecret(env), `file|${code}|${key}`, ttl);
+export async function fileToken(env, key, code, ttl = FILE_TOKEN_TTL, now = Date.now()) {
+  return signToken(fileSecret(env), `file|${code}|${key}`, ttl, now);
 }
 
 export async function verifyFileToken(env, key, code, token) {

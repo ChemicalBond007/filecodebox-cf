@@ -31,6 +31,7 @@ database_id = "f08cde61-a39d-4a56-8cf8-346db7d71a46"
 #    ADMIN_ORIGIN    必需，稳定的 HTTPS 前端 origin（不带末尾斜杠）
 #    ADMIN_KEY       旧变量，仅保留文件令牌兼容，不再用于管理登录
 #    FILE_SECRET     强烈建议（Secret），文件/上传/分片 token 的 HMAC 密钥
+#    TEXT_ENCRYPTION_KEY 文本分享必需（Secret），独立的 32 字节随机密钥，64 位十六进制
 #    APP_NAME / APP_SUBTITLE  可选，界面展示文案（不填则用内置默认值）
 #    IMG_BED_UPLOAD_TOKEN / IMG_BED_UPLOAD_TOKEN_PARAM / IMG_BED_UPLOAD_CHANNEL / IMG_BED_ADMIN_TOKEN  可选
 # 注：本仓库不提交任何敏感信息或占位符，所有配置在面板填写，避免误泄露密钥。
@@ -44,6 +45,6 @@ enabled = true
 enabled = true
 invocation_logs = false
 
-# 定时清理过期 / 超额分享（Cron Trigger）
+# 停用定时调用：后端访问触发后台清理，D1 全局保证自动清理至少间隔 24 小时。
 [triggers]
-crons = ["0 4 * * *"]
+crons = []

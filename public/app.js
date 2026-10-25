@@ -9,6 +9,7 @@
     type: 'text',
     file: null,
     sending: false,
+    maxTextBytes: 222 * 1024,
   };
   // 清除旧版本长期令牌。管理员凭证只保存在 HttpOnly Cookie 中。
   try { localStorage.removeItem('fcb_admin_token'); } catch { /* 存储被禁用 */ }
@@ -28,7 +29,7 @@
     try { data = await res.json(); } catch (e) { /* no body */ }
     if (!res.ok) {
       const err = (data && data.error) || `请求失败 (${res.status})`;
-      throw new Error(err);
+      throw Object.assign(new Error(err), { status: res.status });
     }
     return data;
   }
@@ -65,6 +66,7 @@
       if (cfg.name) $('#appName').textContent = cfg.name;
       if (cfg.subtitle) $('#appSubtitle').textContent = cfg.subtitle;
       state.storage = cfg.storage || ''; // 'Telegram (Bot API)' 或 'CloudFlare-ImgBed (API)'
+      if (Number.isSafeInteger(cfg.maxTextBytes) && cfg.maxTextBytes > 0) state.maxTextBytes = cfg.maxTextBytes;
     } catch (e) { /* 忽略 */ }
   }
 
@@ -207,6 +209,9 @@
       if (type === 'text') {
         const text = $('#textInput').value;
         if (!text.trim()) throw new Error('文本内容不能为空');
+        if (text.length > state.maxTextBytes || new TextEncoder().encode(text).byteLength > state.maxTextBytes) {
+          throw new Error('文本过长（UTF-8 上限 222 KiB，即 227328 字节）');
+        }
         fd.set('text', text);
       } else {
         if (!file) throw new Error('请先选择文件');
@@ -320,30 +325,51 @@
   // ---------- 取件 ----------
   $('#receiveBtn').addEventListener('click', () => doReceive(false));
   $('#pwdSubmit').addEventListener('click', () => doReceive(true));
-  let pendingCode = '';
+  let receiving = false;
+  let passwordCode = '';
+  let claimAttempt = null; // 仅保留结果未知的请求；重试必须沿用 key 并跳过元信息的次数检查。
+
+  $('#codeInput').addEventListener('input', () => {
+    claimAttempt = null;
+    passwordCode = '';
+    $('#receivePwd').value = '';
+    $('#pwdRow').classList.add('hidden');
+  });
 
   async function doReceive(withPwd) {
+    if (receiving) return;
     const out = $('#receiveOut');
     const raw = $('#codeInput').value;
     const code = normalizeCode(raw);
     if (!code) { toast('请输入取件码'); return; }
-    pendingCode = code;
+    if (code !== passwordCode) {
+      $('#receivePwd').value = '';
+      $('#pwdRow').classList.add('hidden');
+      withPwd = false;
+    }
+    const retry = claimAttempt?.code === code && Date.now() - claimAttempt.started < 10 * 60 * 1000;
+    if (!retry) claimAttempt = null;
+    receiving = true;
+    for (const id of ['codeInput', 'receiveBtn', 'receivePwd', 'pwdSubmit']) $('#' + id).disabled = true;
     out.innerHTML = '<div class="spinner">取件中…</div>';
-    $('#pwdRow').classList.add('hidden');
 
     try {
       // 先取元信息
-      const meta = await api('/api/share/' + code);
-      if (meta.has_password && !withPwd) {
-        out.innerHTML = '';
-        $('#pwdRow').classList.remove('hidden');
-        $('#receivePwd').focus();
-        return;
+      if (!retry) {
+        const meta = await api('/api/share/' + code);
+        if (meta.has_password) {
+          passwordCode = code;
+          $('#pwdRow').classList.remove('hidden');
+          if (!withPwd) { out.innerHTML = ''; return; }
+        }
       }
-      // 取件（消耗一次）
+      claimAttempt ||= { code, key: crypto.randomUUID(), started: Date.now(),
+        password: withPwd ? $('#receivePwd').value : '' };
       const fd = new FormData();
-      if (withPwd) fd.set('password', $('#receivePwd').value);
-      const claim = await api('/api/share/' + code + '/claim', { method: 'POST', body: fd });
+      if (claimAttempt.password) fd.set('password', claimAttempt.password);
+      const claim = await api('/api/share/' + code + '/claim', {
+        method: 'POST', body: fd, headers: { 'Idempotency-Key': claimAttempt.key },
+      });
 
       if (claim.type === 'text') {
         out.innerHTML = `<div class="text-result">${escapeHtml(claim.text)}</div>
@@ -359,8 +385,16 @@
           <a class="primary-btn" href="${safeUrl}" download="${safeName}">下载文件</a>
         </div>`;
       }
+      claimAttempt = null;
+      $('#pwdRow').classList.add('hidden');
+      $('#receivePwd').value = '';
     } catch (e) {
+      if ([400, 401, 403, 404, 410, 413, 415, 429].includes(e.status)) claimAttempt = null;
       out.innerHTML = `<div class="msg err">${escapeHtml(e.message)}</div>`;
+    } finally {
+      receiving = false;
+      for (const id of ['codeInput', 'receiveBtn', 'receivePwd', 'pwdSubmit']) $('#' + id).disabled = false;
+      if (!$('#pwdRow').classList.contains('hidden')) $('#receivePwd').focus();
     }
   }
 
@@ -571,7 +605,7 @@
   // ---------- 分享链接直达（#r/CODE） ----------
   function handleHash() {
     const m = location.hash.match(/^#r\/(.+)$/);
-    if (m) {
+    if (m && !receiving) {
       switchView('receive');
       $('#codeInput').value = m[1];
       doReceive(false);

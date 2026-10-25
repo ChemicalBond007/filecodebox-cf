@@ -13,7 +13,7 @@
 // 安全要点：
 //   · 管理员使用 WebAuthn 与有过期时间的 Cookie；文件/上传 token 使用 HMAC
 //   · 文件响应统一 attachment + nosniff，避免上传 HTML/SVG 后在本站同源执行
-//   · 管理接口不加通配 CORS；公开 API 保留 CORS
+//   · 所有接口仅供同源前端使用，不返回跨域授权头
 
 import * as api from './api.js';
 import * as storage from './storage.js';
@@ -21,6 +21,9 @@ import * as db from './db.js';
 import * as telegram from './telegram.js';
 import * as admin from './admin.js';
 import { isValidFileKey } from './auth.js';
+import { HttpError, requireMultipart, formData, fields } from './http.js';
+import { MAX_SHARE_BODY_BYTES } from './config.js';
+import { queueCleanup } from './maintenance.js';
 
 const CSP = [
   "default-src 'self'",
@@ -36,7 +39,7 @@ const CSP = [
   "frame-ancestors 'none'",
 ].join('; ');
 
-function withSecurityHeaders(res, { cors = false, noStore = false } = {}) {
+function withSecurityHeaders(res, { noStore = false } = {}) {
   const headers = new Headers(res.headers);
   headers.set('X-Content-Type-Options', 'nosniff');
   headers.set('X-Frame-Options', 'DENY');
@@ -45,11 +48,8 @@ function withSecurityHeaders(res, { cors = false, noStore = false } = {}) {
   headers.set('Content-Security-Policy', CSP);
   headers.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
   headers.set('Cross-Origin-Opener-Policy', 'same-origin');
-  if (cors) {
-    headers.set('Access-Control-Allow-Origin', '*');
-  } else {
-    headers.delete('Access-Control-Allow-Origin');
-  }
+  for (const name of ['Access-Control-Allow-Origin', 'Access-Control-Allow-Methods',
+    'Access-Control-Allow-Headers', 'Access-Control-Allow-Credentials', 'Access-Control-Max-Age']) headers.delete(name);
   if (noStore) headers.set('Cache-Control', 'no-store');
   return new Response(res.body, { status: res.status, headers });
 }
@@ -72,6 +72,7 @@ const ROUTES = [
   { method: 'POST', pattern: '/api/share', handler: api.createShare },
   { method: 'POST', pattern: '/api/imgbed/upload', handler: async (ctx) => {
     const env = ctx.env;
+    requireMultipart(ctx.request);
     // 配置了 Telegram（TG_BOT_TOKEN + TG_CHAT_ID）则直传 Telegram；否则走外部 ImgBed
     const r = (env.TG_BOT_TOKEN && env.TG_CHAT_ID)
       ? await telegram.uploadToTelegram(env, ctx.request)
@@ -87,8 +88,7 @@ const ROUTES = [
   { method: 'POST', pattern: '/api/chunk/upload', handler: async (ctx) => {
     const { env } = ctx;
     if (!(env.TG_BOT_TOKEN && env.TG_CHAT_ID)) return api.json({ error: '未启用 Telegram 存储' }, 400);
-    let form;
-    try { form = await ctx.request.formData(); } catch (e) { return api.json({ error: '无效的分片上传请求' }, 400); }
+    const form = await formData(ctx.request);
     const file = form.get('file');
     const index = Number.parseInt(String(form.get('index') ?? '0'), 10);
     const fileName = String(form.get('fileName') || `part${String(index).padStart(3, '0')}`).slice(0, 255);
@@ -106,7 +106,7 @@ const ROUTES = [
   { method: 'POST', pattern: '/api/chunk/merge', handler: async (ctx) => {
     const { env } = ctx;
     if (!(env.TG_BOT_TOKEN && env.TG_CHAT_ID)) return api.json({ error: '未启用 Telegram 存储' }, 400);
-    const body = await ctx.request.json().catch(() => ({}));
+    const body = await fields(ctx.request, MAX_SHARE_BODY_BYTES);
     const chunks = body.chunks;
     try {
       const r = await telegram.verifyAndAssembleChunkedKey(env, chunks);
@@ -173,7 +173,6 @@ export default {
     const method = request.method.toUpperCase();
     const adminPath = pathname.startsWith('/api/admin');
     const noStore = pathname.startsWith('/api/') || pathname.startsWith('/file/');
-    const cors = !adminPath && (pathname.startsWith('/api/') || pathname.startsWith('/file/'));
 
     // HEAD 复用 GET 路由（文件服务支持 HEAD）
     const lookupMethod = method === 'HEAD' ? 'GET' : method;
@@ -181,7 +180,7 @@ export default {
     try {
       found = match(lookupMethod, pathname);
     } catch (e) {
-      return withSecurityHeaders(api.json({ error: '非法请求' }, 400), { cors, noStore });
+      return withSecurityHeaders(api.json({ error: '非法请求' }, 400), { noStore });
     }
 
     if (found) {
@@ -189,58 +188,44 @@ export default {
       try {
         if (adminPath) {
           const denied = admin.checkAdminRequest(request, env);
-          if (denied) return withSecurityHeaders(denied, { cors: false, noStore: true });
+          if (denied) return withSecurityHeaders(denied, { noStore: true });
         }
         const res = await found.handler(context);
         const out = method === 'HEAD'
           ? new Response(null, { status: res.status, headers: res.headers })
           : res;
-        return withSecurityHeaders(out, { cors, noStore });
+        return withSecurityHeaders(out, { noStore });
       } catch (e) {
-        console.error('[worker]', e);
-        const err = api.json({ error: '服务器错误' }, 500);
+        if (!(e instanceof HttpError)) console.error('[worker]', e);
+        const err = api.json({ error: e instanceof HttpError ? e.message : '服务器错误' },
+          e instanceof HttpError ? e.status : 500);
         const out = method === 'HEAD'
           ? new Response(null, { status: err.status, headers: err.headers })
           : err;
-        return withSecurityHeaders(out, { cors, noStore });
+        return withSecurityHeaders(out, { noStore });
+      } finally {
+        queueCleanup(env, ctx);
       }
     }
 
     // 预检
     if (method === 'OPTIONS') {
       const headers = new Headers();
-      if (cors) {
-        headers.set('Access-Control-Allow-Origin', '*');
-        headers.set('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
-        headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-        headers.set('Access-Control-Max-Age', '86400');
-      }
       headers.set('Allow', 'GET,POST,DELETE,OPTIONS');
-      return withSecurityHeaders(new Response(null, { status: 204, headers }), { cors, noStore });
+      return withSecurityHeaders(new Response(null, { status: 204, headers }), { noStore });
     }
 
     // 未匹配的 /api/* 返回 JSON 404，而不是 SPA HTML
     if (pathname.startsWith('/api/')) {
-      return withSecurityHeaders(api.json({ error: 'Not Found' }, 404), { cors: false, noStore: true });
+      return withSecurityHeaders(api.json({ error: 'Not Found' }, 404), { noStore: true });
     }
 
     // 其余交给静态资源（SPA）
     if (env.ASSETS) {
       const res = await env.ASSETS.fetch(request);
-      return withSecurityHeaders(res, { cors: false });
+      return withSecurityHeaders(res);
     }
     return withSecurityHeaders(new Response('Not Found', { status: 404 }), {});
   },
 
-  // Cron Trigger：定期清理过期 / 超额分享
-  async scheduled(event, env, ctx) {
-    const keys = await db.sweepExpired(env.fcb_db, Date.now());
-    await admin.cleanupAdmin(env.fcb_db);
-    for (const k of [...new Set(keys)]) {
-      ctx.waitUntil((async () => {
-        const remaining = await db.countSharesByFileKey(env.fcb_db, k);
-        if (remaining === 0) await storage.deleteFromImgBed(env, k);
-      })());
-    }
-  },
 };

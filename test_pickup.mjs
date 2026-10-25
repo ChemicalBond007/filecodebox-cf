@@ -64,7 +64,7 @@ test('gateway forwards only pickup routes and methods without admin credentials'
       method,
       headers: {
         Cookie: '__Host-fcb_admin=test-session', Authorization: 'Bearer private',
-        Origin: origin, Range: 'bytes=0-6',
+        Origin: origin, Range: 'bytes=0-6', 'Idempotency-Key': 'test-idempotency-key',
       },
       ...(method === 'POST' ? { body } : {}),
     }), env);
@@ -80,6 +80,7 @@ test('gateway forwards only pickup routes and methods without admin credentials'
     assert.equal(forwarded.headers.get('Authorization'), null);
     assert.equal(forwarded.headers.get('Origin'), origin);
     assert.equal(forwarded.headers.get('Range'), 'bytes=0-6');
+    assert.equal(forwarded.headers.get('Idempotency-Key'), 'test-idempotency-key');
     if (method === 'POST') assert.equal((await forwarded.formData()).get('password'), 'test-password');
     if (method === 'HEAD') assert.equal(await response.text(), '');
     else assert.equal((await response.json()).ok, true);
@@ -315,7 +316,7 @@ async function app(handler, hash = '', config = { name: 'pickupfiles', subtitle:
     createElement: () => new Element(),
   };
   runInNewContext(script, {
-    document, location, URL, FormData,
+    document, location, URL, FormData, crypto,
     window: { addEventListener: (type, fn) => events.set(type, fn) },
     navigator: { clipboard: { writeText: async value => { copied.push(value); } } },
     fetch: async (path, options) => {
@@ -442,6 +443,79 @@ test('pickup frontend shows expired-share errors and rejects off-site download U
     await a.el('receiveForm').emit('submit');
     assert.match(a.el('receiveOut').textContent, /下载地址无效/);
   }
+});
+
+test('pickup retries an uncertain claim directly with the same key, then rotates after success', async () => {
+  for (const failure of ['network', '503']) {
+    let claims = 0;
+    const a = await app(path => {
+      if (!path.endsWith('/claim')) return claims === 1
+        ? Response.json({ error: '次数用尽' }, { status: 410 }) : { has_password: false };
+      claims++;
+      if (claims === 1) {
+        if (failure === 'network') throw new TypeError('network lost after commit');
+        return Response.json({ error: 'temporary failure' }, { status: 503 });
+      }
+      return { type: 'text', text: 'replayed' };
+    });
+    a.el('codeInput').value = 'ABCD2345';
+    await a.el('receiveForm').emit('submit');
+    const first = a.requests.at(-1).options.headers['Idempotency-Key'];
+    assert.match(first, /^[0-9a-f-]{36}$/i);
+    await a.el('receiveForm').emit('submit');
+    assert.equal(a.requests.at(-1).options.headers['Idempotency-Key'], first);
+    assert.equal(a.requests.filter(r => r.path === '/api/share/ABCD2345').length, 1);
+    assert.equal(a.el('receiveOut').children[0].textContent, 'replayed');
+    await a.el('receiveForm').emit('submit');
+    assert.notEqual(a.requests.at(-1).options.headers['Idempotency-Key'], first);
+  }
+});
+
+test('pickup clears an uncertain attempt when the code changes', async () => {
+  let calls = 0;
+  const a = await app(path => {
+    if (!path.endsWith('/claim')) return { has_password: false };
+    if (++calls === 1) throw new TypeError('network lost');
+    return { type: 'text', text: 'new share' };
+  });
+  a.el('codeInput').value = 'ABCD2345';
+  await a.el('receiveForm').emit('submit');
+  const key = a.requests.at(-1).options.headers['Idempotency-Key'];
+  a.el('codeInput').value = 'NEWCODE1';
+  await a.el('codeInput').emit('input');
+  await a.el('receiveForm').emit('submit');
+  assert.equal(a.requests.at(-1).path, '/api/share/NEWCODE1/claim');
+  assert.notEqual(a.requests.at(-1).options.headers['Idempotency-Key'], key);
+});
+
+test('pickup allows an edited password after an explicit rate-limit failure', async () => {
+  let claims = 0;
+  const a = await app((path, options) => {
+    if (!path.endsWith('/claim')) return { has_password: true };
+    if (++claims === 1) return Response.json({ error: 'rate limited' }, { status: 429 });
+    assert.equal(options.body.get('password'), 'correct');
+    return { type: 'text', text: 'protected' };
+  });
+  a.el('codeInput').value = 'ABCD2345';
+  await a.el('receiveForm').emit('submit');
+  a.el('receivePwd').value = 'wrong';
+  await a.el('pwdRow').emit('submit');
+  const old = a.requests.at(-1).options.headers['Idempotency-Key'];
+  a.el('receivePwd').value = 'correct';
+  await a.el('pwdRow').emit('submit');
+  assert.notEqual(a.requests.at(-1).options.headers['Idempotency-Key'], old);
+  assert.equal(a.el('receiveOut').children[0].textContent, 'protected');
+});
+
+test('pickup strips backend CORS but preserves password rate-limit status and Retry-After', async () => {
+  const response = await gateway.fetch(new Request(origin + '/api/share/ABCD2345/claim', {
+    method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() },
+  }), { BACKEND: { fetch: async () => Response.json({ error: 'rate limited' }, {
+    status: 429, headers: { 'Retry-After': '30', 'Access-Control-Allow-Origin': '*' },
+  }) } });
+  assert.equal(response.status, 429);
+  assert.equal(response.headers.get('Retry-After'), '30');
+  assert.equal(response.headers.get('Access-Control-Allow-Origin'), null);
 });
 
 test('pickup build contains only pickup assets and gateway files', async () => {

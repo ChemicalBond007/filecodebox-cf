@@ -5,6 +5,7 @@ import {
   chunkToken,
   verifyChunkToken,
 } from './auth.js';
+import { formData, HttpError } from './http.js';
 
 // FileCodeBox-CF · Telegram 存储后端（移植自 CloudFlare-ImgBed 的 telegramAPI.js）
 //
@@ -131,9 +132,9 @@ export class TelegramAPI {
 export async function uploadToTelegram(env, request) {
   if (!env.TG_BOT_TOKEN) throw new Error('未配置 TG_BOT_TOKEN（Telegram Bot Token）');
   if (!env.TG_CHAT_ID) throw new Error('未配置 TG_CHAT_ID（文件要发往的频道/群组 ID）');
-  const form = await request.formData();
+  const form = await formData(request);
   const file = form.get('file');
-  if (!file) throw new Error('未找到上传文件');
+  if (!file || typeof file === 'string') throw new HttpError(400, '未找到上传文件');
 
   const tg = new TelegramAPI(env.TG_BOT_TOKEN, env.TG_API || '');
   const fileSize = file.size ?? (file.byteLength || 0);

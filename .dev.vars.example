@@ -2,6 +2,8 @@
 ADMIN_ORIGIN=http://localhost:8787
 ADMIN_API_TOKEN=your-local-admin-api-token
 FILE_SECRET=your-local-file-secret
+# 运行 node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))" 后填入结果。
+TEXT_ENCRYPTION_KEY=replace-with-a-random-64-character-hex-key
 APP_NAME=文件快递柜
 
 # 存储后端二选一：

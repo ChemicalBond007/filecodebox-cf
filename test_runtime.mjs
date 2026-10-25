@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { bindTestAdmin } from './tests/helpers.mjs';
+import { bindTestAdmin, TEST_TEXT_KEY } from './tests/helpers.mjs';
 
 const testStorage = fileURLToPath(new URL(`./.wrangler/runtime-test-${crypto.randomUUID()}/`, import.meta.url));
 mkdirSync(testStorage, { recursive: true });
@@ -24,6 +24,7 @@ const devOptions = {
     ADMIN_API_TOKEN: 'runtime-test-admin',
     ADMIN_ORIGIN: 'https://admin.runtime.test',
     FILE_SECRET: 'runtime-test-signing-secret',
+    TEXT_ENCRYPTION_KEY: TEST_TEXT_KEY,
     TG_BOT_TOKEN: '',
     TG_CHAT_ID: '',
   },
@@ -64,19 +65,84 @@ try {
   assert.equal(create.status, 200);
   const { code } = await create.json();
   assert.match(code, /^[A-Z0-9]{8}$/);
-  const noPassword = await worker.fetch(`/api/share/${code}/claim`, { method: 'POST' });
+  const legacy = await worker.fetch(`/api/share/${code}/claim`, { method: 'POST' });
+  assert.equal(legacy.status, 400, '旧客户端缺少幂等头时必须拒绝');
+  await legacy.text();
+  const noPassword = await worker.fetch(`/api/share/${code}/claim`, {
+    method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() },
+  });
   assert.equal(noPassword.status, 401);
   await noPassword.text();
+  const id = crypto.randomUUID();
   const claims = await Promise.all([1, 2].map(() => worker.fetch(`/api/share/${code}/claim`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'Idempotency-Key': id },
     body: JSON.stringify({ password: 'test-password' }),
   })));
-  assert.deepEqual(claims.map(r => r.status).sort(), [200, 410], 'D1 必须原子执行取件次数限制');
+  assert.deepEqual(claims.map(r => r.status).sort(), [200, 200], '相同 key 并发取件必须复用回执');
   for (const response of claims) {
     const body = await response.json();
     if (response.ok) assert.equal(body.text, 'Workers runtime test');
   }
+  const other = await worker.fetch(`/api/share/${code}/claim`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID() },
+    body: JSON.stringify({ password: 'test-password' }),
+  });
+  assert.equal(other.status, 410, '不同 key 不得绕过次数限制');
+  await other.text();
+  const replay = await worker.fetch(`/api/share/${code}/claim`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': id },
+    body: JSON.stringify({ password: 'test-password' }),
+  });
+  assert.equal(replay.status, 200, '次数用尽后，同一请求仍可重试');
+  assert.equal((await replay.json()).text, 'Workers runtime test');
+  const badType = await worker.fetch('/api/share', {
+    method: 'POST', headers: { 'Content-Type': 'invalid' }, body: 'bad',
+  });
+  assert.equal(badType.status, 415);
+  await badType.text();
+  const large = await worker.fetch('/api/share', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text: 'a'.repeat(222 * 1024 + 1) }),
+  });
+  assert.equal(large.status, 413);
+  await large.text();
+  for (const method of ['GET', 'OPTIONS']) {
+    const publicResponse = await worker.fetch('/api/health', {
+      method, headers: { Origin: 'https://cross-origin.test' },
+    });
+    assert.equal(publicResponse.headers.get('Access-Control-Allow-Origin'), null);
+    await publicResponse.text();
+  }
+  const newShare = await worker.fetch('/api/share', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text: 'distinct-key race', download_limit: 1 }),
+  });
+  const newCode = (await newShare.json()).code;
+  const distinct = await Promise.all([1, 2].map(() => worker.fetch(`/api/share/${newCode}/claim`, {
+    method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() },
+  })));
+  assert.deepEqual(distinct.map(r => r.status).sort(), [200, 410]);
+  for (const response of distinct) await response.text();
+  const form = new FormData();
+  form.set('text', '真实表单中文 🔐');
+  form.set('password', 'form-password');
+  // Node 与 Wrangler 的 FormData 实现不同，传入实际 multipart 字节及匹配的媒体类型。
+  const sendForm = async (path, body, headers = {}) => {
+    const encoded = new Request('https://runtime.test' + path, { method: 'POST', body });
+    return worker.fetch(path, { method: 'POST', body: await encoded.arrayBuffer(),
+      headers: { 'Content-Type': encoded.headers.get('Content-Type'), ...headers } });
+  };
+  const formCreate = await sendForm('/api/share', form);
+  assert.equal(formCreate.status, 200, await formCreate.clone().text());
+  const formCode = (await formCreate.json()).code;
+  const passwordForm = new FormData();
+  passwordForm.set('password', 'form-password');
+  const formClaim = await sendForm(`/api/share/${formCode}/claim`, passwordForm, {
+    'Idempotency-Key': crypto.randomUUID(),
+  });
+  assert.equal(formClaim.status, 200, await formClaim.clone().text());
+  assert.equal((await formClaim.json()).text, '真实表单中文 🔐');
 
   const adminCall = (method, path, body, headers = {}) => worker.fetch(path, {
     method, headers: { Origin: 'https://admin.runtime.test', 'Content-Type': 'application/json', ...headers },
@@ -165,4 +231,29 @@ try {
   console.log('Workers runtime: Telegram single/chunked Range, Content-Length, 416, HEAD and pickup forwarding passed.');
 } finally {
   await downloads.stop();
+}
+
+const maintenance = await unstable_dev(
+  fileURLToPath(new URL('./tests/maintenance-runtime-worker.mjs', import.meta.url)), {
+    ...devOptions,
+    experimental: { ...devOptions.experimental,
+      d1Databases: [{ binding: 'fcb_db', database_name: 'cleanup-test', database_id: 'cleanup-test' }],
+    },
+  });
+try {
+  const now = 1800000001000;
+  const day = 24 * 60 * 60 * 1000;
+  const reserve = async time => {
+    const response = await maintenance.fetch(`/api/reserve?now=${time}`);
+    assert.equal(response.status, 200);
+    return response.json();
+  };
+  const raced = await Promise.all(Array.from({ length: 6 }, () => reserve(now)));
+  assert.equal(raced.filter(r => r.acquired).length, 1);
+  assert.ok(raced.every(r => r.nextRun === now + day));
+  assert.equal((await reserve(now + day - 1)).acquired, false);
+  assert.equal((await reserve(now + day)).acquired, true);
+  console.log('Workers runtime: D1 globally reserves only one automatic cleanup per rolling 24 hours.');
+} finally {
+  await maintenance.stop();
 }

@@ -53,6 +53,7 @@ async function app({ storage = 'CloudFlare-ImgBed (API)', chunkSize = CHUNK_SIZE
   });
   const ids = new Map(elements.filter(el => el.attrs.id).map(el => [el.attrs.id, el]));
   const el = id => {
+    if (id === 'copyText' && !ids.has(id)) ids.set(id, new Element({ id }));
     assert.ok(ids.has(id), '前端元素存在：' + id);
     return ids.get(id);
   };
@@ -83,8 +84,9 @@ async function app({ storage = 'CloudFlare-ImgBed (API)', chunkSize = CHUNK_SIZE
     if (path === '/api/config') return Promise.resolve(Response.json({ storage }));
     if (path === '/api/chunk/init') return Promise.resolve(
       initError ? Response.json({ error: initError }, { status: 503 }) : Response.json({ chunkSize }));
-    return new Promise(resolve => requests.push({
+    return new Promise((resolve, reject) => requests.push({
       path, opts, respond(data, status = 200) { resolve(Response.json(data, { status })); },
+      fail: reject,
     }));
   };
   runInNewContext(script, {
@@ -92,7 +94,7 @@ async function app({ storage = 'CloudFlare-ImgBed (API)', chunkSize = CHUNK_SIZE
     window: { addEventListener() {} },
     location: { origin: 'https://frontend.test', hash: '' },
     localStorage: { removeItem() {} }, navigator: {},
-    fetch, XMLHttpRequest: FakeXHR, FormData,
+    fetch, XMLHttpRequest: FakeXHR, FormData, TextEncoder, crypto,
     setTimeout: () => 0, clearTimeout() {},
   });
   await tick(); // 等待启动配置加载。
@@ -393,4 +395,94 @@ test('文本寄件不显示上传进度，无文件或空文本校验后仍可�
   assert.equal(a.el('sendResult').classList.contains('hidden'), false);
   assert.equal(a.el('uploadProgress').classList.contains('hidden'), true);
   assertUnlocked(a);
+});
+
+test('文本寄件在发送前按 UTF-8 字节拒绝超限中文和 ASCII', async () => {
+  for (const text of ['a'.repeat(222 * 1024 + 1), '界'.repeat(222 * 1024 / 3 + 1)]) {
+    const a = await app();
+    a.el('textInput').value = text;
+    await a.el('sendBtn').click();
+    assert.equal(a.requests.length, 0);
+    assert.match(a.el('toast').textContent, /UTF-8/);
+    assertUnlocked(a);
+  }
+});
+
+test('主站取件防重入；网络或 5xx 后直接复用原 key，成功后新操作换 key', async () => {
+  assert.doesNotMatch(script, /\bpendingCode\b/);
+  for (const failure of ['network', '503']) {
+    const a = await app();
+    a.el('codeInput').value = 'ABCD2345';
+    const first = a.el('receiveBtn').click();
+    await a.el('receiveBtn').click();
+    assert.equal(a.requests.length, 1);
+    a.requests[0].respond({ has_password: false });
+    await tick();
+    const original = a.requests.at(-1);
+    assert.match(original.opts.headers['Idempotency-Key'], /^[0-9a-f-]{36}$/i);
+    if (failure === 'network') original.fail(new TypeError('network lost after commit'));
+    else original.respond({ error: 'temporary failure' }, 503);
+    await first;
+    const retry = a.el('receiveBtn').click();
+    await tick();
+    const repeated = a.requests.at(-1);
+    assert.equal(repeated.path, '/api/share/ABCD2345/claim');
+    assert.equal(repeated.opts.headers['Idempotency-Key'], original.opts.headers['Idempotency-Key']);
+    assert.equal(a.requests.filter(r => !r.path.endsWith('/claim')).length, 1, '重试不得重新读取元信息');
+    repeated.respond({ type: 'text', text: '<retried>' });
+    await retry;
+    assert.match(a.el('receiveOut').innerHTML, /&lt;retried&gt;/);
+    const next = a.el('receiveBtn').click();
+    a.requests.at(-1).respond({ has_password: false });
+    await tick();
+    const fresh = a.requests.at(-1);
+    assert.notEqual(fresh.opts.headers['Idempotency-Key'], original.opts.headers['Idempotency-Key']);
+    fresh.respond({ type: 'text', text: 'new request' });
+    await next;
+  }
+});
+
+test('主站更换取件码会丢弃结果未知的旧请求', async () => {
+  const a = await app();
+  a.el('codeInput').value = 'ABCD2345';
+  const first = a.el('receiveBtn').click();
+  a.requests.at(-1).respond({ has_password: false });
+  await tick();
+  const original = a.requests.at(-1);
+  original.fail(new TypeError('network lost'));
+  await first;
+  a.el('codeInput').value = 'NEWCODE1';
+  await a.el('codeInput').emit('input');
+  const next = a.el('receiveBtn').click();
+  assert.equal(a.requests.at(-1).path, '/api/share/NEWCODE1');
+  a.requests.at(-1).respond({ has_password: false });
+  await tick();
+  const fresh = a.requests.at(-1);
+  assert.notEqual(fresh.opts.headers['Idempotency-Key'], original.opts.headers['Idempotency-Key']);
+  fresh.respond({ type: 'text', text: 'new share' });
+  await next;
+});
+
+test('主站限流明确失败后允许更正密码，不能沿用旧密码', async () => {
+  const a = await app();
+  a.el('codeInput').value = 'ABCD2345';
+  const start = a.el('receiveBtn').click();
+  a.requests.at(-1).respond({ has_password: true });
+  await start;
+  a.el('receivePwd').value = 'wrong';
+  const first = a.el('pwdSubmit').click();
+  a.requests.at(-1).respond({ has_password: true });
+  await tick();
+  const original = a.requests.at(-1);
+  original.respond({ error: 'rate limited' }, 429);
+  await first;
+  a.el('receivePwd').value = 'correct';
+  const next = a.el('pwdSubmit').click();
+  a.requests.at(-1).respond({ has_password: true });
+  await tick();
+  const fresh = a.requests.at(-1);
+  assert.equal(fresh.opts.body.get('password'), 'correct');
+  assert.notEqual(fresh.opts.headers['Idempotency-Key'], original.opts.headers['Idempotency-Key']);
+  fresh.respond({ type: 'text', text: 'protected' });
+  await next;
 });
