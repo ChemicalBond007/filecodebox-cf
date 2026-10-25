@@ -13,9 +13,13 @@
     "test:upload": "node test_upload.mjs",
     "test:runtime": "node test_runtime.mjs",
     "test:pages": "node test_pages.mjs",
+    "test:pickup": "node test_pickup.mjs",
     "pages:build": "node scripts/build-pages.mjs",
     "prepages:deploy": "npm run pages:build",
-    "pages:deploy": "wrangler pages deploy --cwd pages --project-name filecodebox-cf --branch main --commit-dirty=true"
+    "pages:deploy": "wrangler pages deploy --cwd pages --project-name filecodebox-cf --branch main --commit-dirty=true",
+    "pickup:build": "node scripts/build-pickup.mjs",
+    "prepickup:deploy": "npm run pickup:build",
+    "pickup:deploy": "wrangler pages deploy --cwd pickup --project-name pickupfiles --branch main --commit-dirty=true"
   },
   "devDependencies": {
     "wrangler": "^4.152.0"

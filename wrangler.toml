@@ -3,6 +3,10 @@ main = "src/worker.js"
 compatibility_date = "2026-10-24"
 # 变量由控制台管理，CLI 更新代码时保留已有变量。
 keep_vars = true
+# 后端只接受 Pages 的 BACKEND 服务绑定调用，不发布公网 HTTP 入口。
+workers_dev = false
+preview_urls = false
+routes = []
 
 # 静态前端（SPA）：/public 下的 index.html / styles.css / app.js
 [assets]

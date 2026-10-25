@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="referrer" content="no-referrer" />
+  <title>pickupfiles · 取件</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%93%A6%3C/text%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="aurora"></div>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">📦</span>
+      <div class="brand-text">
+        <h1 id="appName">pickupfiles</h1>
+        <p id="appSubtitle">输入取件码，领取文本或文件</p>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="card">
+      <form class="code-entry" id="receiveForm">
+        <input type="text" id="codeInput" placeholder="输入取件码，如 A1B2-C3D4" aria-label="取件码" autocomplete="off" autocapitalize="characters" spellcheck="false" required />
+        <button class="primary-btn" id="receiveBtn" type="submit">取件</button>
+      </form>
+      <form class="pwd-row hidden" id="pwdRow">
+        <input type="password" id="receivePwd" placeholder="该分享需要密码" aria-label="分享密码" autocomplete="off" />
+        <button class="primary-btn" id="pwdSubmit" type="submit">确认</button>
+      </form>
+      <div class="receive-out" id="receiveOut" aria-live="polite" aria-busy="false"></div>
+    </section>
+  </main>
+
+  <footer class="footer">仅提供取件服务</footer>
+  <div class="toast hidden" id="toast" role="status"></div>
+  <script src="/pickup.js"></script>
+</body>
+</html>

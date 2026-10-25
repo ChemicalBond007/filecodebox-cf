@@ -1,0 +1,13 @@
+name = "pickupfiles"
+pages_build_output_dir = "../.wrangler/pickup-dist"
+compatibility_date = "2026-10-25"
+
+[vars]
+# 仅属于副站的公开展示文案，不读取主站 APP_NAME / APP_SUBTITLE。
+PICKUP_NAME = "pickupfiles"
+PICKUP_SUBTITLE = "输入取件码，领取文本或文件"
+
+# 仅通过服务绑定访问现有 Worker；此项目不需要 D1 或存储密钥。
+[[services]]
+binding = "BACKEND"
+service = "filecodebox-cf"

@@ -22,6 +22,9 @@
   ├── Pages（可选）：public/ 静态前端 + /api、/file 同源转发
   │        └── BACKEND service binding ──► Worker
   │
+  ├── 取件 Pages（可选）：pickup/，只开放取件 API 与下载
+  │        └── BACKEND service binding ──► Worker（ImgBed 重定向在取件站服务端跟随）
+  │
   └── Worker（src/worker.js）
            ├── D1 fcb_db：分享元数据、管理员 Passkey/会话
            ├── ImgBed /upload、/file/<id>（R2）
@@ -36,6 +39,7 @@
 - `src/db.js` / `src/admin-schema.js`：D1 表结构与查询
 - `public/`：无构建步骤的 SPA
 - `pages/`：Pages 前端与同源转发入口
+- `pickup/`：独立的取件专用 Pages 页面、受限网关与部署配置
 - `migrations/`：`0001` 分享表、`0002` 管理员 Passkey 表（运行时也会自动建表）
 
 ## 部署
@@ -97,7 +101,11 @@ npm run deploy -- --dry-run
 npm run deploy -- --secrets-file .dev.vars
 ```
 
-部署后访问一次 `/api/install` 可显式初始化 D1；正常使用时也会自动建表。
+> `wrangler.toml` 不再保存 `ADMIN_ORIGIN`（本仓库历史中也不再包含部署域名）。线上请在控制台变量或 `npx wrangler secret put ADMIN_ORIGIN` 中设置（`keep_vars = true` 会保留控制台已有配置）；`.dev.vars` 里的 `http://localhost:8787` 仅供本地，用 `--secrets-file .dev.vars` 部署前必须换成线上 origin，否则管理登录会因 RP ID 不匹配而失败。
+
+后端配置为 `workers_dev = false`、`preview_urls = false`、`routes = []`，不发布 `workers.dev`、Worker 预览 URL 或自定义 HTTP 路由。主站和取件站仍通过 `BACKEND` service binding 调用，Cron 不受影响。正常使用时会自动初始化 D1，无需直接访问 Worker 的 `/api/install`。
+
+上述限制需重新部署 Worker 后生效，不会仅因修改本地文件而关闭现网地址。已有的额外自定义域名、版本/部署 URL 和其他环境的公开入口，还应在 Cloudflare 控制台分别核对并停用；不要给后端重新添加公网路由。
 
 ### 4. 部署 Pages 前端（推荐）
 
@@ -110,7 +118,27 @@ npm run pages:deploy
 
 `pages:deploy` 会先执行 `scripts/build-pages.mjs`，把前端和转发入口复制到 `.wrangler/pages-dist/`。`pages/_headers` 提供 CSP 等安全响应头，`pages/_routes.json` 控制 Functions 路由。
 
-如果不用 Pages，也可以直接访问 Worker 的 `workers.dev` 地址；此时把 `ADMIN_ORIGIN` 改成该 Worker 的 HTTPS origin。
+当前部署方案要求使用 Pages 主站，不能直接访问后端的 `workers.dev` 地址；`ADMIN_ORIGIN` 应保持为主站 Pages 或其自定义域名的 HTTPS origin。
+
+### 4.1. 部署取件专用站点（可选）
+
+`pickupfiles` 是另一个独立的 Pages 项目，与原站共用已有 Worker 和分享数据。原站的寄件、取件、管理功能及生成链接的方式均不改变。
+
+```bash
+npx wrangler pages project create pickupfiles --production-branch main
+npm run pickup:deploy
+```
+
+- `pickup:deploy` 先把取件页面、共享样式和网关构建到 `.wrangler/pickup-dist/`，只上传明确列出的文件，不包含原站的 `app.js`、管理页面或本地密钥。
+- `pickup/wrangler.toml` 的 `BACKEND` service binding 默认指向同账号下的 `filecodebox-cf` Worker；如果原 Worker 名称不同，请修改 `service`。不需要绑定 D1、复制存储密钥或更改 `ADMIN_ORIGIN`。
+- 把取件站地址和取件码发给对方即可，也可以发送 `https://<your-pickup-project>.pages.dev/#r/取件码`（以实际部署域名为准）。原站生成的 `#r/CODE` 链接换成取件站域名也能使用。
+- 副站默认名称为 `pickupfiles`，UI 复用原站样式，但名称和配置完全独立。在 `pickup/wrangler.toml` 的 `[vars]` 中设置 `PICKUP_NAME` / `PICKUP_SUBTITLE` 后重新部署副站即可修改；这两个字段是公开文案，不要写入原站地址或敏感信息。主站仍独立使用 `APP_NAME` / `APP_SUBTITLE`，互不影响。
+- 副站的 `GET /api/config` 由自身网关直接返回，仅包含副站 `name` / `subtitle`，不调用 `BACKEND`，不返回主站品牌、存储类型或寄件配置。配置加载失败时，页面保留独立的 `pickupfiles` 默认名称。
+- 修改本地项目名不会自动重命名或停用已经部署的旧 Pages 项目。
+- 支持文本、文件、密码取件和文件 `Range` / `HEAD` 请求。只有分享元信息、取件和文件下载会转发给后端；寄件、上传、分片、安装、管理等接口均返回 404，且不转发管理 Cookie。
+- 浏览器只向取件站发出请求。ImgBed 下载重定向由取件站服务端跟随并流式返回，不把存储地址或上游 Cookie 发送给浏览器；Telegram 下载仍通过 Worker 流式返回。
+
+取件站不会在页面或请求中配置原站网址，但这不等于给原站 Pages 增加访问控制，已经知道原站地址的人仍可直接访问。分享内容由寄件人提供，如果需要隐藏原站，请不要在分享的文本、文件名或副站的公开文案中写入原站地址。
 
 ### 5. 首次绑定 Passkey
 
@@ -146,6 +174,8 @@ IMG_BED_URL=https://imgbed.test
 npm test                 # 分享、管理、上传核心测试
 npm run test:runtime     # 真实 workerd + D1 关键流程
 npm run test:pages       # Pages 转发入口
+npm run test:pickup      # 取件站网关与前端流程
+npm run pickup:build     # 构建取件专用 Pages
 ```
 
 Telegram 本地端到端测试（内置 mock，无需真实 Bot）：
