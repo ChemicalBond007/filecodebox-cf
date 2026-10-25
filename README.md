@@ -171,7 +171,8 @@ IMG_BED_URL=https://imgbed.test
 测试：
 
 ```bash
-npm test                 # 分享、管理、上传核心测试
+npm test                 # 分享、管理、上传和 Telegram 下载核心测试
+npm run test:telegram    # Telegram Range / HEAD / 416 回归测试（无需真实 Bot）
 npm run test:runtime     # 真实 workerd + D1 关键流程
 npm run test:pages       # Pages 转发入口
 npm run test:pickup      # 取件站网关与前端流程
@@ -204,7 +205,8 @@ BASE=http://127.0.0.1:8088 node tg_e2e_test.mjs
 - 大文件：前端 `init → 逐片 /api/chunk/upload → /api/chunk/merge`，每片最多 20 MiB，最多 1000 片；
 - 取件：Worker 服务端用 bot token 调 `getFile`，流式返回；文件响应强制 `attachment` + `application/octet-stream` + `nosniff`；
 - 删除分享只删取件码，**不删除 Telegram 频道/群组里的文件**；
-- 单文件下载受 Telegram `getFile` 的 20 MiB 限制；分片文件按片拼接，支持 Range/HEAD。
+- 单文件下载受 Telegram `getFile` 的 20 MiB 限制；分片文件按片拼接。两种模式均支持单段 Range（指定区间、开放末尾、后缀）和 HEAD，越界返回 416 + `Content-Range: bytes */总长度`。
+- 单文件按上游 `Content-Length` 流式截取，不将整个文件读入内存；上游长度未知时返回完整文件。多段/无效 Range 或无法验证的 `If-Range` 回退完整下载；HEAD 忽略 Range，只返回完整文件的响应头。
 
 | 场景 | 限制 |
 |---|---|

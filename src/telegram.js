@@ -119,7 +119,9 @@ export class TelegramAPI {
     const filePath = await this.getFilePath(fileId);
     if (!filePath) throw new Error(`File path not found for fileId: ${fileId}`);
     const fullURL = `${this.fileDomain}/file/bot${this.botToken}/${filePath}`;
-    return fetch(fullURL, { headers: this.defaultHeaders });
+    return fetch(fullURL, {
+      headers: { ...this.defaultHeaders, 'Accept-Encoding': 'identity' },
+    });
   }
 }
 
@@ -272,8 +274,73 @@ function baseDownloadHeaders(disposition) {
   return headers;
 }
 
+// 不支持多段请求；无效语法忽略 Range。BigInt 避免超长十进制范围溢出。
+function byteRange(request, size) {
+  if (request.method !== 'GET' || request.headers.has('If-Range')) return null;
+  const match = /^bytes=(\d*)-(\d*)$/i.exec(request.headers.get('Range') || '');
+  if (!match || (!match[1] && !match[2])) return null;
+  const start = match[1] ? BigInt(match[1]) : null;
+  const end = match[2] ? BigInt(match[2]) : null;
+  const total = BigInt(size);
+  if (start !== null && end !== null && start > end) return null;
+  if (!size || (start === null ? end === 0n : start >= total)) {
+    return { unsatisfiable: true };
+  }
+  return {
+    start: start === null ? Number(end < total ? total - end : 0n) : Number(start),
+    end: start === null || end === null || end >= total ? size - 1 : Number(end),
+  };
+}
+
+function unsatisfiedRange(size, disposition) {
+  const headers = baseDownloadHeaders(disposition);
+  headers.set('Accept-Ranges', 'bytes');
+  headers.set('Content-Range', `bytes */${size}`);
+  return new Response(null, { status: 416, headers });
+}
+
+// 按需跳过前缀、输出范围并取消剩余上游数据；客户端取消时也释放上游连接。
+function sliceStream(body, start, end) {
+  const reader = body.getReader();
+  let position = 0;
+  return new ReadableStream({
+    async pull(controller) {
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) {
+            controller.close();
+            return;
+          }
+          const offset = position;
+          position += value.byteLength;
+          if (position <= start) continue;
+          controller.enqueue(value.subarray(Math.max(0, start - offset),
+            Math.min(value.byteLength, end + 1 - offset)));
+          if (position > end) {
+            controller.close();
+            await reader.cancel();
+          }
+          return;
+        }
+      } catch (error) {
+        controller.error(error);
+        await reader.cancel(error).catch(() => {});
+      }
+    },
+    cancel(reason) { return reader.cancel(reason); },
+  }, { highWaterMark: 0 });
+}
+
+// Workers 只会为已知长度的流生成 Content-Length；Node 测试使用标准流。
+function fixedLengthBody(body, length) {
+  return typeof FixedLengthStream === 'function'
+    ? body.pipeThrough(new FixedLengthStream(length))
+    : body;
+}
+
 // 取件：先校验短时 token，再在服务端用 bot token 取回文件内容并流式返回。
-// 分片文件按序串联各片（支持 Range / HEAD）；单文件直接透传（不占内存）。
+// 单文件流式截取、分片文件按序串联，各自支持 Range / HEAD。
 // 响应统一 attachment + application/octet-stream，避免 Content-Type 由用户控制。
 export async function serveFromTelegram(env, request, key, code, meta) {
   if (!isValidFileKey(key)) return new Response('无效的文件标识', { status: 400 });
@@ -313,7 +380,7 @@ export async function serveFromTelegram(env, request, key, code, meta) {
   // 不信任客户端提交的 file_type：统一以二进制附件返回，避免 HTML/SVG 同源执行。
   const disposition = dispositionValue(meta && meta.file_name);
 
-  // ---- 单文件：直接透传 Telegram 响应体（不读入内存），保留原行为 ----
+  // ---- 单文件：从上游真实长度解析 Range，不信任客户端的 file_size ----
   if (!isChunked) {
     let resp;
     try {
@@ -322,43 +389,52 @@ export async function serveFromTelegram(env, request, key, code, meta) {
       console.error('[telegram download]', e);
       return new Response('Telegram 取文件失败', { status: 502 });
     }
-    if (!resp.ok) return new Response('Telegram 取文件失败', { status: 502 });
+    if (!resp.ok) {
+      await resp.body?.cancel();
+      return new Response('Telegram 取文件失败', { status: 502 });
+    }
     const headers = baseDownloadHeaders(disposition);
     const len = resp.headers.get('Content-Length');
-    if (len) headers.set('Content-Length', len);
-    if (request.method === 'HEAD') return new Response(null, { status: 200, headers });
-    return new Response(resp.body, { status: 200, headers });
+    const size = len !== null && /^\d+$/.test(len) ? Number(len) : NaN;
+    const knownSize = Number.isSafeInteger(size) && size >= 0;
+    if (knownSize) {
+      headers.set('Content-Length', String(size));
+      headers.set('Accept-Ranges', 'bytes');
+    }
+    const range = knownSize ? byteRange(request, size) : null;
+    if (range?.unsatisfiable) {
+      await resp.body?.cancel();
+      return unsatisfiedRange(size, disposition);
+    }
+    if (request.method === 'HEAD') {
+      await resp.body?.cancel();
+      return new Response(null, { status: 200, headers });
+    }
+    if (range && resp.body) {
+      const length = range.end - range.start + 1;
+      headers.set('Content-Length', String(length));
+      headers.set('Content-Range', `bytes ${range.start}-${range.end}/${size}`);
+      return new Response(fixedLengthBody(sliceStream(resp.body, range.start, range.end), length),
+        { status: 206, headers });
+    }
+    const body = knownSize && resp.body ? fixedLengthBody(resp.body, size) : resp.body;
+    return new Response(body, { status: 200, headers });
   }
 
   // ---- 分片文件：流式串联 + Range / HEAD ----
   const totalSize = chunks.reduce((t, c) => t + (c.size || 0), 0);
-
-  // 解析 Range（仅支持单段 bytes=start-end）
-  let rangeStart = 0;
-  let rangeEnd = totalSize - 1;
-  let isRange = false;
-  const rangeHdr = request.headers.get('Range');
-  if (rangeHdr) {
-    const m = /bytes=(\d+)-(\d*)/.exec(rangeHdr);
-    if (m) {
-      rangeStart = parseInt(m[1], 10);
-      rangeEnd = m[2] ? parseInt(m[2], 10) : totalSize - 1;
-      isRange = true;
-      if (rangeStart > rangeEnd || rangeStart >= totalSize) {
-        return new Response('Range Not Satisfiable', { status: 416 });
-      }
-      if (rangeEnd > totalSize - 1) rangeEnd = totalSize - 1;
-    }
+  if (!Number.isSafeInteger(totalSize) || chunks.some(c => !Number.isSafeInteger(c.size))) {
+    return new Response('分片信息损坏', { status: 502 });
   }
+  const range = byteRange(request, totalSize);
+  if (range?.unsatisfiable) return unsatisfiedRange(totalSize, disposition);
+  const isRange = range !== null;
+  const rangeStart = range?.start ?? 0;
+  const rangeEnd = range?.end ?? totalSize - 1;
 
   if (request.method === 'HEAD') {
     const h = baseDownloadHeaders(disposition);
     h.set('Accept-Ranges', 'bytes');
-    if (isRange) {
-      h.set('Content-Range', `bytes ${rangeStart}-${rangeEnd}/${totalSize}`);
-      h.set('Content-Length', String(rangeEnd - rangeStart + 1));
-      return new Response(null, { status: 206, headers: h });
-    }
     h.set('Content-Length', String(totalSize));
     return new Response(null, { status: 200, headers: h });
   }
@@ -411,8 +487,8 @@ export async function serveFromTelegram(env, request, key, code, meta) {
   if (isRange) {
     headers.set('Content-Length', String(rangeEnd - rangeStart + 1));
     headers.set('Content-Range', `bytes ${rangeStart}-${rangeEnd}/${totalSize}`);
-    return new Response(stream, { status: 206, headers });
+    return new Response(fixedLengthBody(stream, rangeEnd - rangeStart + 1), { status: 206, headers });
   }
   headers.set('Content-Length', String(totalSize));
-  return new Response(stream, { status: 200, headers });
+  return new Response(fixedLengthBody(stream, totalSize), { status: 200, headers });
 }

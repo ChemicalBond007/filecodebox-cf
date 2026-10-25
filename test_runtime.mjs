@@ -12,7 +12,7 @@ if (process.platform === 'win32') {
   process.env.TMP = testStorage;
 }
 const { unstable_dev } = await import('wrangler');
-const worker = await unstable_dev(fileURLToPath(new URL('./src/worker.js', import.meta.url)), {
+const devOptions = {
   config: fileURLToPath(new URL('./wrangler.toml', import.meta.url)),
   ip: '127.0.0.1',
   port: 0,
@@ -33,7 +33,8 @@ const worker = await unstable_dev(fileURLToPath(new URL('./src/worker.js', impor
     watch: false,
     d1Databases: [{ binding: 'fcb_db', database_name: 'runtime-test', database_id: 'runtime-test' }],
   },
-});
+};
+const worker = await unstable_dev(fileURLToPath(new URL('./src/worker.js', import.meta.url)), devOptions);
 
 try {
   const home = await worker.fetch('/');
@@ -120,4 +121,48 @@ try {
   console.log('Workers runtime: routing, atomic claims, real WebAuthn signatures, API key lockout, concurrent challenge/recovery and session revocation passed.');
 } finally {
   await worker.stop();
+}
+
+const downloads = await unstable_dev(
+  fileURLToPath(new URL('./tests/telegram-runtime-worker.mjs', import.meta.url)), devOptions);
+try {
+  for (const mode of ['single', 'chunked']) {
+    for (const [range, expected, contentRange] of [
+      ['bytes=2-6', 'cdefg', 'bytes 2-6/10'],
+      ['bytes=7-', 'hij', 'bytes 7-9/10'],
+      ['bytes=-3', 'hij', 'bytes 7-9/10'],
+    ]) {
+      const response = await downloads.fetch(`/api/${mode}`, { headers: { Range: range } });
+      assert.equal(response.status, 206);
+      assert.equal(response.headers.get('Content-Range'), contentRange);
+      assert.equal(response.headers.get('Content-Length'), String(expected.length),
+        '真实 Workers 响应必须保留部分内容的准确长度');
+      assert.equal(response.headers.get('Accept-Ranges'), 'bytes');
+      assert.equal(response.headers.get('Content-Type'), 'application/octet-stream');
+      assert.match(response.headers.get('Content-Disposition'), /^attachment;/);
+      assert.equal(await response.text(), expected);
+    }
+    const invalid = await downloads.fetch(`/api/${mode}`, { headers: { Range: 'bytes=10-' } });
+    assert.equal(invalid.status, 416);
+    assert.equal(invalid.headers.get('Content-Range'), 'bytes */10');
+    assert.equal(await invalid.text(), '');
+    const head = await downloads.fetch(`/api/${mode}`, {
+      method: 'HEAD', headers: { Range: 'bytes=999-' },
+    });
+    assert.equal(head.status, 200);
+    assert.equal(head.headers.get('Content-Length'), '10');
+    assert.equal(head.headers.get('Content-Range'), null);
+    assert.equal(await head.text(), '');
+    const full = await downloads.fetch(`/api/${mode}`);
+    assert.equal(full.status, 200);
+    assert.equal(full.headers.get('Content-Length'), '10');
+    assert.equal(await full.text(), 'abcdefghij');
+  }
+  const empty = await downloads.fetch('/api/empty', { headers: { Range: 'bytes=0-' } });
+  assert.equal(empty.status, 416);
+  assert.equal(empty.headers.get('Content-Range'), 'bytes */0');
+  assert.equal(await empty.text(), '');
+  console.log('Workers runtime: Telegram single/chunked Range, Content-Length, 416, HEAD and pickup forwarding passed.');
+} finally {
+  await downloads.stop();
 }
